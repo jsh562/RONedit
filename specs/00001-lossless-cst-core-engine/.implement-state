@@ -1,0 +1,6 @@
+phase: OBJ1 complete (Stage A) — proceeding to OBJ2
+completed: 19
+remaining: 20
+blocked: none
+notes: ron-core lexer/parser/printer/CST/syntax built; 30 tests green; clippy -D warnings clean; fmt clean. Public API: parse(&str)->CstDocument, parse_bytes(&[u8])->Result<CstDocument,LexError>, print(&CstDocument)->String, CstDocument{root()->SyntaxNode, diagnostics()->&[Diagnostic], source_len()}, SyntaxNode/SyntaxToken/SyntaxElement/SyntaxKind/TextRange, validate_utf8. Diagnostic currently lives in parser.rs (to be moved/extended to diagnostics.rs in OBJ2).
+timestamp: 2026-06-11

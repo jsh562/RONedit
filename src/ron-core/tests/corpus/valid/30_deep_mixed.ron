@@ -1,0 +1,31 @@
+// A deeply mixed document exercising many constructs together.
+World(
+    name: "overworld",
+    entities: [
+        Entity(
+            id: 1,
+            transform: Transform(
+                position: (0.0, 0.0, 0.0),
+                rotation: (0.0, 0.0, 0.0, 1.0),
+            ),
+            tags: {"player": true, "spawn": true},
+            inventory: Some([
+                Item(name: "sword", qty: 1),
+                Item(name: "potion", qty: 5),
+            ]),
+        ),
+        Entity(
+            id: 2,
+            transform: Transform(
+                position: (10.5, 0.0, -3.25),
+                rotation: (0.0, 0.707, 0.0, 0.707),
+            ),
+            tags: {},
+            inventory: None,
+        ),
+    ],
+    metadata: {
+        1: "first",
+        ('x', 'y'): "coord",
+    },
+)

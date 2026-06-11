@@ -1,0 +1,7 @@
+// Raw strings with embedded quotes and hashes.
+[
+    r"simple raw",
+    r#"raw with "quotes""#,
+    r##"raw with "# inside"##,
+    r#"path C:\Users\name\file.txt"#,
+]

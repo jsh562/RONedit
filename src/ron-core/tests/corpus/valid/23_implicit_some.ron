@@ -1,0 +1,7 @@
+#![enable(implicit_some)]
+// With implicit_some, a bare value stands in for Some(value).
+(
+    nickname: "Ace",
+    score: 100,
+    note: None,
+)

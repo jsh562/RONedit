@@ -1,0 +1,12 @@
+// Float forms: decimals, exponents, signs, suffixes.
+[
+    0.0,
+    3.14159,
+    -2.5,
+    +1.0,
+    1e10,
+    1.5e-3,
+    6.022e23,
+    2.0f32,
+    1.7976931348623157e308f64,
+]

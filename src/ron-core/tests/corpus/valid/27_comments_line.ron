@@ -1,0 +1,7 @@
+// Leading line comment.
+Settings(
+    volume: 80, // inline comment after a field
+    // standalone comment between fields
+    brightness: 50,
+)
+// trailing line comment, no newline after this one

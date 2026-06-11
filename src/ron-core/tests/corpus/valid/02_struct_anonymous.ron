@@ -1,0 +1,6 @@
+// An anonymous (unnamed) struct.
+(
+    x: 1.0,
+    y: -2.5,
+    z: 0.0,
+)

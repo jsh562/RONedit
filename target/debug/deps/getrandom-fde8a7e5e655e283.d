@@ -1,0 +1,11 @@
+S:\claudecode\RONedit\target\debug\deps\getrandom-fde8a7e5e655e283.d: C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\lib.rs C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\backends.rs C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\error.rs C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\util.rs C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\error_std_impls.rs C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\../README.md C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\backends\windows.rs
+
+S:\claudecode\RONedit\target\debug\deps\libgetrandom-fde8a7e5e655e283.rmeta: C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\lib.rs C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\backends.rs C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\error.rs C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\util.rs C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\error_std_impls.rs C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\../README.md C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\backends\windows.rs
+
+C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\lib.rs:
+C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\backends.rs:
+C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\error.rs:
+C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\util.rs:
+C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\error_std_impls.rs:
+C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\../README.md:
+C:\Users\Zero2\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\getrandom-0.3.4\src\backends\windows.rs:

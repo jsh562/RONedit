@@ -1,0 +1,5 @@
+// A struct-style enum variant payload.
+Resize {
+    width: 1920,
+    height: 1080,
+}

@@ -1,0 +1,9 @@
+[package]
+name = "ronin-app"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RONin desktop application shell (stub; full implementation deferred to E003)."
+
+[dependencies]

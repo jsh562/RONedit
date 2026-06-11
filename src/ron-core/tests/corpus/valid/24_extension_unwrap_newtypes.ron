@@ -1,0 +1,6 @@
+#![enable(unwrap_newtypes)]
+// unwrap_newtypes lets newtype wrappers be written without the wrapper.
+(
+    id: 7,
+    label: "node",
+)

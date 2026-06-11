@@ -1,0 +1,6 @@
+// A list/seq with a trailing comma (must be preserved).
+[
+    "alpha",
+    "beta",
+    "gamma",
+]
