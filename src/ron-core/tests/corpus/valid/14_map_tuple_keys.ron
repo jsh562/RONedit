@@ -1,0 +1,6 @@
+// A map keyed by tuples (composite, non-string keys).
+{
+    (0, 0): "origin",
+    (1, 0): "east",
+    (0, 1): "north",
+}

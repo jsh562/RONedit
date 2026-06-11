@@ -1,0 +1,6 @@
+// Option values: explicit Some / None.
+(
+    nickname: Some("Ace"),
+    middle_name: None,
+    score: Some(100),
+)

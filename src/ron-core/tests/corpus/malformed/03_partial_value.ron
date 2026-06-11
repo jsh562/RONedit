@@ -1,0 +1,4 @@
+// Malformed: a partial top-level value cut off mid-construct.
+Player(
+    name: "incomplete",
+    inventory: Some(

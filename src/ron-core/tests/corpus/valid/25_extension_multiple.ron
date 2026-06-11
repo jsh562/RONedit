@@ -1,0 +1,8 @@
+#![enable(implicit_some)]
+#![enable(unwrap_newtypes)]
+#![enable(unwrap_variant_newtypes)]
+// Multiple extension attributes stacked at the top of the document.
+Config(
+    retries: 3,
+    timeout: 30.0,
+)

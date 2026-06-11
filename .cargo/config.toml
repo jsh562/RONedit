@@ -1,0 +1,9 @@
+# Local cargo configuration for the RONin workspace.
+#
+# `http.check-revoke = false` works around a Windows/schannel TLS certificate
+# revocation-check failure (CRYPT_E_NO_REVOCATION_CHECK) when reaching the
+# crates.io registry in this environment. It only disables the OCSP/CRL
+# *revocation* probe; certificate chain validation still applies. This is a
+# local developer/CI environment accommodation, not a security policy change.
+[http]
+check-revoke = false

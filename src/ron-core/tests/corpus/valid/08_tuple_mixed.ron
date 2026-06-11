@@ -1,0 +1,2 @@
+// A tuple mixing several scalar kinds.
+(42, "text", 'q', true, 3.14, ())

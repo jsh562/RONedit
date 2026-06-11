@@ -1,0 +1,3 @@
+// Malformed: stray / unexpected tokens scattered through the document.
+[1 @ 2 # 3 $ 4] %^&
+Foo(x: 1) extra trailing junk ] ) }

@@ -1,0 +1,7 @@
+// A map with non-string keys (integers, chars, bools).
+{
+    1: "one",
+    2: "two",
+    'a': "char-key",
+    true: "bool-key",
+}

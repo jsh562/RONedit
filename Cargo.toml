@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "src/ron-core",
+    "src/ron-types",
+    "src/ronin-app",
+]
+# The cargo-fuzz crate depends on `libfuzzer-sys` (nightly + libFuzzer only) and
+# must NOT be part of the stable workspace build/test. It is built solely via
+# `cargo +nightly fuzz run` from `src/ron-core/fuzz/`.
+exclude = [
+    "src/ron-core/fuzz",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.77"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ronin/ronin"

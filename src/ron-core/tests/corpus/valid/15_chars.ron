@@ -1,0 +1,2 @@
+// Char literals including escapes and unicode.
+['a', 'Z', '0', ' ', '\n', '\t', '\\', '\'', '\u{1F600}', 'é']
