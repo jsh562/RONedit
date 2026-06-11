@@ -1,0 +1,73 @@
+# TESTING CHECKLIST: Lossless CST Core Engine
+**Created**: 2026-06-11 | **Feature**: [spec.md](../spec.md)
+
+## Invariant Testability (round-trip / idempotence / no-panic)
+
+- [X] CHK001 Is the round-trip identity invariant stated in falsifiable terms (output bytes == input bytes) rather than as a goal? [Testability, Spec §TR-003/SC-001] <!-- Evaluator: Covered by spec.md §TR-003 ("output bytes identical to the original input") and §SC-001 ("byte-for-byte") -->
+- [X] CHK002 Is the domain of the round-trip invariant unambiguously bounded to "every accepted (UTF-8) input — valid or malformed" so a test oracle knows which inputs must hold? [Clarity, Spec §Constraints/SC-003] <!-- Evaluator: Covered by spec.md §Technical Constraints (round-trip "for every accepted (UTF-8) input — valid or malformed") and §SC-001/SC-003 -->
+- [X] CHK003 Does the spec define the no-panic oracle precisely enough to assert against (no panic on any byte sequence, including non-UTF-8 rejected as a clean Err)? [Testability, Spec §TR-001/SC-003] <!-- Evaluator: Covered by spec.md §TR-001 (non-UTF-8 "rejected... with a clean error (never a panic)") and §SC-003 -->
+- [X] CHK004 Is the token-coverage invariant ("concatenation of the tree's token texts equals the input") expressed as a measurable equality usable by property and fuzz tests? [Testability, Spec §SC-003/Key Entities] <!-- Evaluator: Covered by spec.md §SC-003 and data-model.md §INV-1 (single-token byte coverage) -->
+- [X] CHK005 Is an idempotent-print invariant (print(parse(print(x))) == print(parse(x))) a named, testable requirement, or only implied by round-trip? [Completeness, Plan §Testing Strategy] <!-- Resolved: added TR-017 (idempotent print) + SC-009 [OBJ1] -->>
+- [X] CHK006 Is determinism ("identical input yields an identical tree") defined with a comparison criterion a test can apply (structural equality vs. byte equality of print)? [Testability, Spec §TR-012] <!-- Evaluator: Covered by spec.md §TR-012 and data-model.md §INV-6 (comparison criterion: same kinds, order, ranges + identical diagnostics) -->
+- [X] CHK007 Are the three load-bearing invariants (round-trip, idempotence, no-panic) each individually traceable to at least one success criterion? [Traceability, Spec §SC-001..SC-003] <!-- Resolved: round-trip→SC-001/002, idempotence→SC-009/TR-017, no-panic→SC-003 -->
+
+## Grammar-Surface Property Coverage
+
+- [X] CHK008 Does the spec enumerate the full grammar surface that property tests must exercise (structs, enums/variants, tuples, lists/seqs, maps incl. non-string keys, chars, strings, raw strings, numbers, bools, unit, Option/implicit_some, extension attributes)? [Completeness, Spec §TR-004/SC-002] <!-- Evaluator: Covered by spec.md §TR-004 (full enumeration) + Objective 1 deliverables + data-model.md SyntaxKind groupings -->
+- [X] CHK009 Is the grammar authority pinned to a specific version (`ron = "=0.12.1"`) so "full grammar surface" is a closed, testable set rather than open-ended? [Clarity, Spec §TR-004 / Plan §AD-002] <!-- Evaluator: Covered by plan.md §AD-002 ("Pin ron = "=0.12.1"") + research.md §Dependency pins + spec.md §TR-004 -->
+- [X] CHK010 Are non-string map keys called out as a distinct construct the generator must produce, not merged with string-keyed maps? [Completeness, Spec §TR-004/Edge Cases] <!-- Evaluator: Covered by spec.md §TR-004 ("maps (including non-string keys)"), §Edge Cases, and data-model.md note ("non-string map keys... distinct, preserved constructs, not collapsed") -->
+- [X] CHK011 Is the distinction between tuples, lists/sequences, and maps stated clearly enough that a generator and an assertion can keep them separate? [Clarity, Spec §TR-004/Edge Cases] <!-- Evaluator: Covered by spec.md §Edge Cases ("Tuples vs lists/sequences vs maps... preserved as distinct constructs") + data-model.md Composite-values kinds -->
+- [X] CHK012 Are ambiguous literal forms (raw strings with embedded quotes/hashes, numeric/escape forms, char literals) identified as requiring dedicated coverage? [Completeness, Spec §Risks / Edge Cases] <!-- Evaluator: Covered by spec.md §Risks ("Ambiguous literal forms") + plan.md §Risk Mitigation ("Targeted insta snapshot tests per literal kind") -->
+- [X] CHK013 Does the spec require coverage of all documented extension attributes (`implicit_some`, `unwrap_newtypes`, `unwrap_variant_newtypes`) plus the unknown-extension-preserved-as-text case? [Completeness, Spec §TR-004/Edge Cases] <!-- Evaluator: Covered by spec.md §Edge Cases + §TR-004 + data-model.md RON-extensions group (unknown extension attrs preserved as text) -->
+- [X] CHK014 Are trivia-bearing edge cases (comments, trailing commas, BOM, CRLF vs LF, missing trailing newline, empty/whitespace-only/comments-only files) named as inputs that property/snapshot tests must cover? [Completeness, Spec §Edge Cases/SC-002] <!-- Evaluator: Covered by spec.md §Edge Cases (empty/whitespace-only/comments-only, missing trailing newline, CRLF/LF, BOM) + Objective 1 Validation Criterion 2 (comments, trailing commas) -->
+- [X] CHK015 Is it specified whether constructs excluded from ron 0.12 (e.g. base64 byte strings, `#![type]`/`#![schema]`) are out-of-scope for generators, so coverage gaps are intentional? [Consistency, Research §Dependency pins] <!-- Evaluator: Covered by research.md §Dependency pins ("ron 0.12 removed base64 byte strings and ignores #![type]/#![schema] — out of grammar scope") -->
+
+
+## Corpus Coverage
+
+- [X] CHK016 Is the corpus composition ("real serde + Bevy `.scn.ron` files") defined specifically enough to assess representativeness? [Clarity, Spec §SC-001/Assumptions] <!-- Evaluator: Covered by spec.md §SC-001 + §Assumptions ("real serde and Bevy .scn.ron files") -->
+- [X] CHK017 Does the success criterion state a measurable corpus pass bar (100% of files byte-for-byte) rather than a qualitative one? [Testability, Spec §SC-001] <!-- Evaluator: Covered by spec.md §SC-001 ("reproduces 100% of files byte-for-byte"; malformed files included in denominator) -->
+- [X] CHK018 Is there a stated minimum or sourcing rule for corpus size/diversity so "representative" is verifiable rather than subjective? [Measurability, Spec §SC-001/Assumptions] <!-- Resolved: SC-001/Assumptions now require ≥30 files, ≥1 per TR-004 group, ≥3 malformed, ≥1 file ≥1 MB -->
+- [X] CHK019 Is the corpus harness's only allowed I/O boundary (filesystem read of fixtures) explicitly scoped to avoid contaminating the WASM-clean core? [Consistency, Plan §Testing Strategy/TR-007] <!-- Evaluator: Covered by plan.md §Testing Strategy (Integration "Mock Boundary: filesystem read of corpus fixtures only") + TR-007 (core stays WASM-clean; I/O lives in app) -->
+- [X] CHK020 Is there a requirement covering how new grammar constructs discovered in the corpus feed back into property-test coverage (the grammar-completeness risk)? [Completeness, Spec §Risks / Plan §Risk Mitigation] <!-- Evaluator: Resolved — added TR-015 to spec.md and corpus→property feedback to plan.md §Risk Mitigation + §Requirement Coverage Map -->
+
+
+## Fuzz No-Panic Oracle
+
+- [X] CHK021 Is the fuzz oracle stated as concrete assertions (no panic AND token-text concatenation equals input) rather than just "run the fuzzer"? [Testability, Spec §SC-003 / Plan §Testing Strategy] <!-- Evaluator: Covered by spec.md §SC-003 (no panics + token-text concat == input) + plan.md §Testing Strategy ("fuzz no-panic + round-trip") + §Error Handling -->
+- [X] CHK022 Is the non-UTF-8 fuzz path's expected behavior (clean rejection, no panic, outside round-trip) distinguished from the accepted-input path? [Clarity, Spec §TR-001/SC-003] <!-- Evaluator: Covered by spec.md §TR-001 + §SC-003 (non-UTF-8 rejected without panicking, outside round-trip) + plan.md §Error Handling table (two distinct rows) -->
+- [X] CHK023 Does the spec specify what "finds no panics" means as an acceptance condition (e.g. duration/corpus seeding) so the result is reproducible and not open-ended? [Measurability, Spec §SC-003] <!-- Resolved: SC-003 now sets a seeded ≥1,000,000-iteration (or fixed CI time-budget) cargo-fuzz run; crash inputs added to the seed corpus -->
+- [X] CHK024 Is termination on all input ("parsing terminates") asserted as a testable property, including its dependence on the must-consume-a-token invariant? [Testability, Spec §TR-014 / Plan §HINT-004] <!-- Evaluator: Covered by spec.md §TR-014 + Objective 2 Validation Criterion 2 ("parsing terminates") + plan.md §HINT-004 (every loop iteration consumes >=1 token) -->
+
+
+## Snapshot Determinism
+
+- [X] CHK025 Are snapshot tests scoped to deterministic, stable output (CST shape / printed bytes) and explicitly excluded from snapshotting volatile data? [Testability, Research §Testing / Plan §Testing Strategy] <!-- Evaluator: Covered by research.md §Testing strategy (scope "CST/print"; pitfall "snapshotting volatile data" called out to avoid) + plan.md §Testing Strategy ("snapshot CST/print") -->
+- [X] CHK026 Is per-literal-kind snapshot coverage (raw strings, numbers, non-string keys) called out as a mitigation that maps to specific testable cases? [Completeness, Spec §Risks / Plan §Risk Mitigation] <!-- Evaluator: Covered by spec.md §Risks ("Ambiguous literal forms") + plan.md §Risk Mitigation ("Targeted insta snapshot tests per literal kind") -->
+- [X] CHK027 Does determinism (TR-012) give snapshot tests a stated guarantee that identical input yields identical, stable snapshots across runs? [Consistency, Spec §TR-012/SC-002] <!-- Evaluator: Covered by spec.md §TR-012 + data-model.md §INV-6 (determinism: identical input -> identical tree + diagnostics), guaranteeing stable snapshots -->
+
+
+## Error-Recovery & Diagnostics Measurability
+
+- [X] CHK028 Is "every produced diagnostic carries a correct source byte range" expressed as a checkable property over a malformed-sample set? [Testability, Spec §TR-006/SC-004] <!-- Evaluator: Covered by spec.md §TR-006 ("precise source byte range to every diagnostic") + §SC-004 ("every produced diagnostic carries a correct source byte range") -->
+- [X] CHK029 Is the malformed-sample set defined specifically enough (unclosed delimiters, stray tokens, partial top-level value) to assess coverage of recovery paths? [Completeness, Spec §Edge Cases/SC-004] <!-- Evaluator: Covered by spec.md §Edge Cases ("unclosed delimiters, stray tokens, partial top-level value") + §SC-004 (malformed-sample set) -->
+- [X] CHK030 Is the "one diagnostic per recovery point" rule stated precisely enough to assert diagnostic count against recovery points? [Testability, Spec §TR-013] <!-- Evaluator: Covered by spec.md §TR-013 ("emitting one diagnostic per recovery point") + data-model.md Diagnostic invariant (not duplicated per recovery event) -->
+- [X] CHK031 Is the diagnostic contract (fixed severity enum Error/Warning, stable `RON-Pxxxx` code registry) defined as a stable surface tests can pin? [Clarity, Spec §TR-013 / Plan §AD-003] <!-- Evaluator: Covered by spec.md §TR-013 (fixed severity enum + stable RON-Pxxxx registry, part of stable API) + plan.md §AD-003 + data-model.md Diagnostic -->
+- [X] CHK032 Is "ERROR nodes cover all input" testable via the same token-coverage equality used for valid inputs, so recovered trees are held to the round-trip invariant? [Consistency, Spec §TR-005/SC-004] <!-- Evaluator: Covered by spec.md §TR-005 + §SC-001 (malformed corpus files re-print to original) + data-model.md §INV-3 (recovery completeness: INV-1/INV-2 still hold for error trees) -->
+- [X] CHK033 Is the bounded-nesting behavior testable (a documented depth bound, no stack overflow, a diagnostic emitted past the limit) with the limit value or its documentation source identified? [Testability, Spec §TR-014/SC-008 / Plan §AD-005] <!-- Evaluator: Covered by spec.md §TR-014 (documented nesting/recursion bound; diagnostic past limit; no overflow) + §SC-008 + plan.md §AD-005 (configurable depth guard) -->
+
+
+## Coverage Policy & Success-Criteria Measurability
+
+- [X] CHK034 Is the coverage policy unambiguous that no percentage target is enforced (advisory only), so QC does not gate on a threshold? [Clarity, Plan §Testing Strategy/Coverage tier] <!-- Evaluator: Covered by plan.md §Testing Strategy Coverage tier ("advisory; no enforced target per policy") + project-instructions.md ("Coverage Target: none") -->
+- [X] CHK035 Is each Success Criterion (SC-001..SC-008) phrased as a measurable, technology-agnostic outcome with a clear pass/fail condition? [Measurability, Spec §SC-001..SC-008] <!-- Evaluator: Covered by spec.md §Success Criteria (each SC has a concrete pass/fail condition: 100% corpus, no panics, build succeeds, no overflow, byte-identical regions) -->
+- [X] CHK036 Is the correctness-only envelope (termination + bounded depth; benchmark harness with no pass/fail gate) stated clearly so reviewers do not expect performance gating? [Consistency, Spec §Constraints / Plan §Performance Goals] <!-- Evaluator: Covered by spec.md §Technical Constraints ("correctness, not a performance threshold... benchmark harness... no pass/fail gate") + plan.md §Performance Goals -->
+- [X] CHK037 Does every TR (TR-001..TR-014) trace to at least one verification mechanism (property/snapshot/corpus/fuzz/wasm build) in the Testing Strategy or Coverage Map? [Traceability, Plan §Requirement Coverage Map/Testing Strategy] <!-- Evaluator: Resolved — added a Verification Mechanism Map (TR -> mechanism) to plan.md §Testing Strategy covering TR-001..TR-015 -->
+
+
+## WASM Build Verification as an Acceptance Gate
+
+- [X] CHK038 Is the wasm32 build defined as a binary acceptance gate (`cargo build -p ron-core --target wasm32-unknown-unknown` succeeds) rather than a recommendation? [Testability, Spec §SC-005/TR-007] <!-- Evaluator: Covered by spec.md §SC-005 (exact command "succeeds") + §TR-007 + plan.md §Testing Strategy mandatory gates -->
+- [X] CHK039 Is "no filesystem/UI/async/native dependencies" stated as a checkable condition (enforced by the build proof) rather than relying on source review alone? [Testability, Spec §SC-005 / Research §WASM-clean] <!-- Evaluator: Covered by spec.md §SC-005 + research.md §WASM-clean ("only a real wasm build proves cleanliness") + data-model.md §INV-9 ("wasm32 build gate is the proof") -->
+- [X] CHK040 Is the API-cleanliness acceptance condition (consumer parses/navigates/reads diagnostics/prints with no I/O types and no leaked rowan types) testable via a consumer crate, distinct from the wasm build gate? [Testability, Spec §SC-006/TR-009] <!-- Evaluator: Covered by spec.md §SC-006 + §TR-009 + Objective 3 Validation Criterion 2 ("a consumer crate depending only on ron-core") -->
+

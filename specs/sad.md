@@ -235,4 +235,7 @@ Project-level architectural decisions are maintained as standalone MADR files un
 
 ## Project Context Baseline Updates
 
-- [Reserved for reusable project-level technical context promoted from downstream planning runs.]
+- **Core dependency baseline**: rowan 0.16.1 is the lossless CST library (pure-Rust, wasm32-clean); cstree 0.14.0 is the documented alternative but requires edition 2024 / Rust 1.85. `ron = "=0.12.1"` is the pinned authoritative RON grammar/extension surface — interop-only (E010), never a `ron-core` dependency.
+- **Diagnostic convention**: parser and validation diagnostics use a namespaced `RON-Pxxxx` code registry with a fixed severity enum (Error/Warning), one diagnostic per recovery point.
+- **Input contract**: `ron-core` accepts UTF-8 only (leading BOM preserved as trivia); non-UTF-8 is rejected cleanly at the API boundary, never partially loaded.
+- **Test/QC baseline**: core invariants verified via proptest (round-trip/idempotence) + insta snapshots + a real serde/Bevy corpus + cargo-fuzz (no-panic); supply chain via cargo-audit + cargo-deny; coverage advisory (cargo-llvm-cov), no enforced percentage.
