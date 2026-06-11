@@ -45,4 +45,4 @@
 <!-- Managed by /sddp-init. QC reads this section — do not edit manually. -->
 
 **Coverage Target**: 
-**Required Categories**: 
+**Required Categories**: linting, security
