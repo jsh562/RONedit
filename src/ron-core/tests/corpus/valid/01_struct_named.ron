@@ -1,0 +1,7 @@
+// A named struct with several field kinds.
+Player(
+    name: "Aria",
+    level: 12,
+    health: 98.5,
+    alive: true,
+)

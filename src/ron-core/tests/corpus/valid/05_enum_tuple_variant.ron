@@ -1,0 +1,2 @@
+// A tuple-style enum variant payload.
+Move(10, 20)

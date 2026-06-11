@@ -1,0 +1,26 @@
+// Representative Bevy-scene-shaped fixture with enum components (hand-authored,
+// not a verbatim upstream file).
+(
+    resources: {},
+    entities: {
+        10: (
+            components: {
+                "my_game::ai::Behavior": Patrol(
+                    waypoints: [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)],
+                    speed: 2.5,
+                ),
+                "my_game::state::Phase": Combat {
+                    target: Some(42),
+                    aggression: 0.8,
+                },
+                "my_game::loot::Drop": None,
+            },
+        ),
+        11: (
+            components: {
+                "my_game::ai::Behavior": Idle,
+                "my_game::render::Visibility": Hidden,
+            },
+        ),
+    },
+)

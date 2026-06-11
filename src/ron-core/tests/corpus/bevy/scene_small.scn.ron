@@ -1,0 +1,39 @@
+// Representative Bevy-scene-shaped fixture (hand-authored, not a verbatim
+// upstream file). Mirrors the structure of a Bevy `DynamicScene` serialized to
+// RON: a top-level struct with `resources` and an `entities` map keyed by id.
+(
+    resources: {
+        "bevy_time::time::Time": (
+            delta: 0.016,
+            elapsed: 12.5,
+        ),
+    },
+    entities: {
+        0: (
+            components: {
+                "bevy_transform::components::transform::Transform": (
+                    translation: (0.0, 0.0, 0.0),
+                    rotation: (0.0, 0.0, 0.0, 1.0),
+                    scale: (1.0, 1.0, 1.0),
+                ),
+                "bevy_core::name::Name": (
+                    hash: 12345,
+                    name: "Camera",
+                ),
+            },
+        ),
+        1: (
+            components: {
+                "bevy_transform::components::transform::Transform": (
+                    translation: (5.0, 2.0, -1.0),
+                    rotation: (0.0, 0.707, 0.0, 0.707),
+                    scale: (1.0, 1.0, 1.0),
+                ),
+                "my_game::components::Health": (
+                    current: 100.0,
+                    max: 100.0,
+                ),
+            },
+        ),
+    },
+)

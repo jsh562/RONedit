@@ -1,0 +1,5 @@
+/* block comment at the top */
+/* nested /* block */ comment */
+Data(
+    /* before field */ value: 42, /* after field */
+)

@@ -1,0 +1,4 @@
+// Malformed: missing commas and colons between elements/entries.
+[1 2 3 4]
+{ a 1 b 2 }
+Foo(x 1 y 2)

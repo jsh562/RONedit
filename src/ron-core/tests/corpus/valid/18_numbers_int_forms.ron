@@ -1,0 +1,15 @@
+// Integer forms: decimal, hex, octal, binary, underscores, signs, suffixes.
+[
+    0,
+    42,
+    -17,
+    +99,
+    1_000_000,
+    0xFF,
+    0xDEAD_BEEF,
+    0o755,
+    0b1010_0101,
+    255u8,
+    -128i8,
+    9_223_372_036_854_775_807i64,
+]
