@@ -362,10 +362,11 @@ pub fn from_json(value: &Value) -> Result<TypeModel, InterchangeError> {
         let defs = defs
             .as_object()
             .ok_or_else(|| InterchangeError::new("$defs must be a JSON object"))?;
-        // BTreeMap iteration is sorted; but definitions_order must reflect the
-        // serialized order. serde_json preserves object order only with the
-        // `preserve_order` feature (not enabled), so reconstruct order from the
-        // (sorted) map — deterministic and stable for round-trips.
+        // `definitions_order` must reflect the serialized `$defs` order. The
+        // `serde_json` `preserve_order` feature is enabled (see Cargo.toml), so
+        // this object iterates in its original serialized order; reconstruct
+        // `definitions_order` by inserting in that iteration order — deterministic
+        // and stable for round-trips.
         for (name, node_value) in defs {
             let node = json_to_node(node_value)?;
             model.insert_named(name.clone(), node);
