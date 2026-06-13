@@ -82,15 +82,22 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod completion;
 pub mod diagnostics;
 pub mod edit;
+pub mod formatter;
 pub mod lexer;
 pub mod parser;
 pub mod printer;
 pub mod syntax;
 
+pub use completion::{
+    completion_context, completions, CompletionContext, CompletionItem, CompletionKind,
+    PositionKind,
+};
 pub use diagnostics::{Diagnostic, DiagnosticCode, Severity};
 pub use edit::{apply_edit, EditError, EditKind, EditOperation, EditTarget, TriviaPolicy};
+pub use formatter::{format, format_node, BlankLinePolicy, FormatConfig, FormatResult};
 pub use lexer::{validate_utf8, LexError};
 pub use parser::{
     parse, parse_bytes, parse_with_options, CstDocument, ParseOptions, DEFAULT_MAX_DEPTH,

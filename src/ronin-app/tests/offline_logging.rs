@@ -64,6 +64,7 @@ fn settings_round_trip_through_save_to_load_from() {
         }),
         preferences: prefs,
         large_file_threshold: 1_234_567,
+        ..AppSettings::default()
     };
 
     original.save_to(&path).expect("save settings to temp path");

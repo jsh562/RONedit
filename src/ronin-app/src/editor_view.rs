@@ -16,29 +16,63 @@
 //!   oversize, highlighting/squiggles are suppressed but editing stays fully
 //!   functional and a non-blocking degrade label is shown (FR-017).
 //!
-//! # Deferred scope (E005 / E006)
+//! # Large-file degrade reuse (E005 Wave 5, FR-026)
 //!
-//! This widget provides structural highlighting and squiggles only. The
-//! intelligence layered on top of the editing surface is deferred:
+//! The E005 per-frame intelligence layered here degrades on the **same** signal as
+//! E003's highlighting/squiggles: the document being `oversize`. The structural
+//! completion popup is gated by [`completion_enabled`], which suppresses it past
+//! `AppSettings::large_file_threshold` exactly as highlighting is suppressed, and
+//! the **existing** E003 degrade indicator ("Large file — highlighting disabled")
+//! communicates the state — E005 adds **no** separate message. The explicit Format
+//! Document / Format Selection commands are *not* per-frame intelligence; they stay
+//! available on an oversize document (a one-shot, verify-before-replace action that
+//! never blocks interactive editing), consistent with E003 only degrading the
+//! always-on layer, not on-demand commands.
 //!
-//! * **autocomplete** and **format** (reflow / pretty-print) — deferred to
-//!   **E005**;
-//! * **type validation** (schema-aware, type-checked diagnostics over the
-//!   structural ones) — deferred to **E006**.
+//! # No silent reformat (E005, FR-009)
 //!
-//! Both attach here, at the editing surface, without changing the shell.
+//! This widget edits the buffer in place; ordinary typing/edits **never** reformat.
+//! A buffer mutation only bumps the document's edit generation via
+//! [`EditorDocument::on_edit`] (so a coalesced *reparse* — for highlighting and
+//! diagnostics — is requested next frame). It does **not** call `ron_core::format`.
+//! Reformatting happens exclusively through the explicit Format Document / Format
+//! Selection commands or the opt-in format-on-save path, both of which live on the
+//! [`crate::app::App`] shell and go through its single safe apply path. The reparse
+//! triggered after a command-driven buffer replacement is the same generation-keyed
+//! refresh used for typing — it recomputes derived state, never the buffer text.
+//!
+//! # Deferred seams
+//!
+//! This widget now carries the full **structural** E005 authoring surface:
+//! highlighting, squiggles, the completion popup ([`completion_popup`]), and
+//! snippet tab-stop navigation ([`snippet_navigation`]). The deeper intelligence
+//! that layers on top of this editing surface is deferred to later epics and
+//! attaches here without changing the shell:
+//!
+//! * **type-aware completion / snippets** (schema-aware ranking + offering only
+//!   type-legal candidates) and **type validation** (type-checked diagnostics over
+//!   the structural ones) → **E006**;
+//! * **semantic / CST-backed undo-redo** of an authoring action → **E007** (the
+//!   verified buffer splices here are the seam an undo stack records against);
+//! * **tree / table structured editing** as an alternate surface → **E008**;
+//! * **Bevy-registry-aware** authoring (registry-resolved component/field names and
+//!   snippets) → **E009**;
+//! * **RON⇄JSON interop / `derive`-driven** authoring → **E010** (interop lives
+//!   outside the editing surface and the `ron-core` engine).
 
 use std::sync::Arc;
 
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
-use egui::text_edit::TextEditState;
-use egui::{Align, Color32, FontId, Galley, Pos2, Rect, Stroke, TextBuffer, Ui};
+use egui::text_edit::{TextEditOutput, TextEditState};
+use egui::{Align, Color32, FontId, Galley, Key, Modifiers, Pos2, Rect, Stroke, TextBuffer, Ui};
 
-use ron_core::{Severity, SyntaxKind};
+use ron_core::{CompletionKind, Severity, SyntaxKind};
 
+use crate::completion::Trigger;
 use crate::diagnostics_map::DiagnosticView;
 use crate::document::{EditorDocument, HighlightModel, HighlightSpan};
 use crate::reparse::ParseResult;
+use crate::snippets::TabStopKind;
 
 /// The classification a highlight span carries (FR-019).
 ///
@@ -438,12 +472,45 @@ pub fn editor_view(ui: &mut Ui, doc: &mut EditorDocument, oversize: bool) -> boo
         if !diagnostics.is_empty() {
             draw_squiggles(ui, &output.galley, output.galley_pos, &diagnostics);
         }
+
+        // Snippet tab-stop navigation (E005 Wave 4, FR-016). Runs BEFORE the
+        // completion popup so an active snippet's `Tab`/`Shift+Tab` drive its stops
+        // rather than the completion accept. A buffer edit drops the session.
+        snippet_navigation(ui, doc, &output);
+
+        // Structural autocomplete popup over the editor (E005 Wave 3, FR-022).
+        // Suppressed on oversize files (the highlight/intelligence layer is off).
+        // Suppressed while a snippet session is active so `Tab` is unambiguous.
+        if completion_enabled(oversize, doc.snippet_session.is_some())
+            && completion_popup(ui, doc, &output)
+        {
+            changed = true;
+        }
     });
 
     if changed {
         doc.on_edit();
     }
     changed
+}
+
+/// Whether the structural-completion popup runs this frame (E005 Wave 5, T041,
+/// FR-026).
+///
+/// Completion is a per-frame, always-on intelligence layer, so it degrades on the
+/// **same** signal E003 already uses to suppress highlighting + squiggles: the
+/// document being `oversize` (past `AppSettings::large_file_threshold`). When the
+/// file is oversize, completion is suppressed exactly like highlighting/squiggles
+/// and the existing E003 non-blocking degrade label ("Large file — highlighting
+/// disabled") communicates the state — E005 invents **no** separate message. It is
+/// also suppressed while a snippet tab-stop session is active so `Tab` unambiguously
+/// drives snippet navigation rather than a completion accept.
+///
+/// Pure and side-effect-free so the gating decision is unit-testable without a live
+/// egui frame.
+#[must_use]
+pub fn completion_enabled(oversize: bool, snippet_session_active: bool) -> bool {
+    !oversize && !snippet_session_active
 }
 
 /// Move the editor caret to `char_offset` and scroll it into view (FR-009).
@@ -466,6 +533,344 @@ fn apply_cursor_jump(ui: &Ui, output: &egui::text_edit::TextEditOutput, char_off
     let local = output.galley.pos_from_cursor(cursor);
     let screen = local.translate(output.galley_pos.to_vec2());
     ui.scroll_to_rect(screen, Some(Align::Center));
+}
+
+/// Drive + render the structural autocomplete popup over the editor (E005 Wave 3,
+/// US2, AD-007/HINT-005).
+///
+/// This is the egui half of the custom popup; the cross-frame decision logic lives
+/// in [`crate::completion::CompletionState`] (headlessly tested, T031). Per frame
+/// it:
+///
+/// 1. reads the live caret (a collapsed cursor, no active selection) as a byte
+///    offset into the buffer;
+/// 2. handles popup keystrokes *before* they reach text editing when the popup is
+///    open — `Esc` dismisses (keeping the literal), `Up`/`Down` highlight, and
+///    `Enter`/`Tab` accept **only** when an item is explicitly highlighted
+///    (otherwise the literal stands; FR-012);
+/// 3. recomputes candidates from the buffer + caret — auto-trigger mid-identifier,
+///    or manual-invoke (`Ctrl`+`Space`) at any value slot; an empty/ambiguous
+///    context shows no list (FR-014);
+/// 4. renders the candidate list in analysis order, visually secondary to the
+///    literal, anchored just below the caret.
+///
+/// Returns `true` when an accepted suggestion mutated the buffer (so the caller
+/// requests a reparse).
+///
+/// # Headless-rendering boundary (E003)
+///
+/// The popup's *rendering* and live keystroke routing are exercised manually / in
+/// QC. The buffer-mutating decisions (trigger, dismiss, accept + CST-verified
+/// splice) are covered headlessly via the `completion` module API (T031).
+pub fn completion_popup(ui: &mut Ui, doc: &mut EditorDocument, output: &TextEditOutput) -> bool {
+    // Only operate with a single collapsed caret (no active selection): completion
+    // is meaningless across a selection.
+    let Some(range) = output.cursor_range else {
+        doc.completion.dismiss();
+        return false;
+    };
+    if !range.is_empty() {
+        doc.completion.dismiss();
+        return false;
+    }
+    let caret_char = range.primary.index;
+    let caret_byte = char_to_byte(&doc.buffer, caret_char);
+
+    // ---- keystroke handling (only while the popup is open) ----
+    let mut accept_now = false;
+    if doc.completion.is_open() {
+        if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            // Esc dismisses; the user's literal is untouched (FR-022).
+            doc.completion.dismiss();
+            return false;
+        }
+        if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+            doc.completion.highlight_next();
+        }
+        if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+            doc.completion.highlight_prev();
+        }
+        // Enter/Tab accept ONLY when an item is explicitly highlighted; otherwise
+        // we leave the key for the TextEdit so the literal stands (FR-012). We
+        // therefore only *consume* the key when we will actually accept.
+        if doc.completion.highlighted_item().is_some() {
+            let enter = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+            let tab = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab));
+            if enter || tab {
+                accept_now = true;
+            }
+        }
+    }
+
+    // ---- accept a highlighted suggestion (CST-verified splice, FR-013) ----
+    if accept_now {
+        if let Some(accepted) = doc.completion.accept(&doc.buffer, caret_byte) {
+            doc.buffer = accepted.new_buffer;
+            doc.completion.dismiss();
+            // Move the caret to the end of the inserted text (FR-022).
+            let new_char = byte_to_char(&doc.buffer, accepted.new_caret_byte);
+            set_caret(ui, output, new_char);
+            doc.on_edit();
+            return true;
+        }
+        // A refused splice (would corrupt) keeps the literal; just dismiss.
+        doc.completion.dismiss();
+        return false;
+    }
+
+    // ---- recompute candidates (trigger / dismiss) ----
+    let manual = ui.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Space));
+    let trigger = if manual {
+        Trigger::Manual
+    } else {
+        Trigger::Auto
+    };
+    let open = doc.completion.recompute(&doc.buffer, caret_byte, trigger);
+
+    // ---- render ----
+    if open {
+        render_completion_list(ui, output, doc, caret_char);
+    }
+    false
+}
+
+/// Drive snippet tab-stop navigation over the editor while a session is active
+/// (E005 Wave 4, US3, FR-016).
+///
+/// Per frame, when [`EditorDocument::snippet_session`] is `Some`:
+///
+/// 1. drops the session if the buffer was edited out from under it (a stop offset no
+///    longer maps), so an edit during navigation never lands the caret out of bounds;
+/// 2. on `Esc`, ends navigation (the inserted text stays — only navigation stops);
+/// 3. on `Tab` / `Shift+Tab`, moves to the next / previous stop and installs the new
+///    caret + selection into the live `TextEdit` (so the user can overtype a
+///    placeholder default); reaching past the final `$0` ends navigation (FR-016);
+/// 4. renders the inline choice picker for a [`TabStopKind::Choice`] active stop.
+///
+/// The keys are consumed only while a session is active, so ordinary `Tab` typing is
+/// unaffected once navigation ends.
+///
+/// # Headless-rendering boundary (E003)
+///
+/// The live keystroke routing + the choice-picker rendering are exercised
+/// manually / in QC; the session's pure navigation logic (next/prev/end, caret +
+/// selection derivation) is covered headlessly via the `snippets` module API (T038).
+fn snippet_navigation(ui: &mut Ui, doc: &mut EditorDocument, output: &TextEditOutput) {
+    let Some(session) = doc.snippet_session.as_mut() else {
+        return;
+    };
+    if !session.is_active() {
+        doc.snippet_session = None;
+        return;
+    }
+
+    // If the active stop's range no longer fits the buffer (the user edited the text
+    // during navigation), end the session rather than risk an out-of-bounds caret.
+    let char_len = doc.buffer.chars().count();
+    if session
+        .active_stop()
+        .is_some_and(|s| s.char_end > char_len || s.char_start > char_len)
+    {
+        doc.snippet_session = None;
+        return;
+    }
+
+    // Esc ends navigation (the inserted snippet text is kept; only nav stops).
+    if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+        session.end();
+        doc.snippet_session = None;
+        return;
+    }
+
+    // Tab → next stop; Shift+Tab → previous. Consume so the TextEdit does not also
+    // insert a tab / move focus while a session is active.
+    let mut moved = false;
+    if ui.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Tab)) {
+        session.prev_stop();
+        moved = true;
+    } else if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)) {
+        session.next_stop();
+        moved = true;
+    }
+
+    if moved {
+        match session.active_stop() {
+            Some(stop) => {
+                // Install the new caret + (placeholder/choice) selection so the user
+                // can immediately overtype the default value.
+                let (start, end) = (stop.char_start, stop.char_end);
+                set_caret_range(ui, output, start, end);
+            }
+            None => {
+                // Past the final stop: navigation has ended (FR-016).
+                doc.snippet_session = None;
+                return;
+            }
+        }
+    }
+
+    // Render the inline choice picker for a choice-kind active stop.
+    if let Some(stop) = doc.snippet_session.as_ref().and_then(|s| s.active_stop()) {
+        if let TabStopKind::Choice { options } = &stop.kind {
+            let options = options.clone();
+            let (start, end) = (stop.char_start, stop.char_end);
+            render_choice_picker(ui, output, doc, start, end, &options);
+        }
+    }
+}
+
+/// Render the inline choice picker for a snippet choice tab-stop (FR-016).
+///
+/// Shows the options as a small floating list anchored at the stop; picking one
+/// replaces the stop's current text `[start, end)` with the chosen option (a plain
+/// buffer splice — the option came from the snippet body, so the result still
+/// round-trips) and advances the session's stop offsets are left for the next nav.
+fn render_choice_picker(
+    ui: &mut Ui,
+    output: &TextEditOutput,
+    doc: &mut EditorDocument,
+    start: usize,
+    end: usize,
+    options: &[String],
+) {
+    let anchor_rect = output
+        .galley
+        .pos_from_cursor(CCursor::new(start))
+        .translate(output.galley_pos.to_vec2());
+    let anchor = Pos2::new(anchor_rect.left(), anchor_rect.bottom() + 2.0);
+
+    let mut picked: Option<String> = None;
+    egui::Area::new(ui.id().with("ronin_snippet_choice"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(anchor)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_max_width(200.0);
+                for opt in options {
+                    if ui.selectable_label(false, opt).clicked() {
+                        picked = Some(opt.clone());
+                    }
+                }
+            });
+        });
+
+    if let Some(choice) = picked {
+        // Splice the chosen option over the stop's current text.
+        let start_byte = char_to_byte(&doc.buffer, start);
+        let end_byte = char_to_byte(&doc.buffer, end);
+        if start_byte <= end_byte && end_byte <= doc.buffer.len() {
+            let mut next = String::with_capacity(doc.buffer.len());
+            next.push_str(&doc.buffer[..start_byte]);
+            next.push_str(&choice);
+            next.push_str(&doc.buffer[end_byte..]);
+            // Only commit if the choice keeps the buffer parseable (it should, since
+            // the option came from the snippet body) — never corrupt (§I).
+            if ron_core::parse(&next).diagnostics().len()
+                <= ron_core::parse(&doc.buffer).diagnostics().len()
+            {
+                doc.buffer = next;
+                let new_end = start + choice.chars().count();
+                set_caret_range(ui, output, start, new_end);
+                doc.on_edit();
+                // The chosen text length may differ; end the picker's stop selection.
+                // The next Tab continues navigation from here.
+            }
+        }
+    }
+}
+
+/// Install a (possibly non-collapsed) caret selection `[start, end)` into the live
+/// `TextEdit` state, so the user can overtype a placeholder default (FR-016).
+fn set_caret_range(ui: &Ui, output: &TextEditOutput, start: usize, end: usize) {
+    let id = output.response.response.id;
+    let ctx = ui.ctx();
+    let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+    let range = CCursorRange::two(CCursor::new(start), CCursor::new(end));
+    state.cursor.set_char_range(Some(range));
+    state.store(ctx, id);
+    // Scroll the stop into view.
+    let local = output.galley.pos_from_cursor(CCursor::new(start));
+    let screen = local.translate(output.galley_pos.to_vec2());
+    ui.scroll_to_rect(screen, Some(Align::Center));
+}
+
+/// Render the open completion list as an `egui::Area` just below the caret.
+///
+/// Items are shown in analysis order (kind-then-alpha, already ranked below the
+/// literal). The explicitly-highlighted row (if any) is visually selected; the
+/// list as a whole is rendered weakly/secondary so it never visually competes with
+/// the literal the user typed (FR-022).
+fn render_completion_list(
+    ui: &Ui,
+    output: &TextEditOutput,
+    doc: &EditorDocument,
+    caret_char: usize,
+) {
+    let items = doc.completion.items();
+    if items.is_empty() {
+        return;
+    }
+    // Anchor just below the caret's galley rectangle.
+    let caret_rect = output
+        .galley
+        .pos_from_cursor(CCursor::new(caret_char))
+        .translate(output.galley_pos.to_vec2());
+    let anchor = Pos2::new(caret_rect.left(), caret_rect.bottom() + 2.0);
+
+    let highlighted = doc.completion.highlighted();
+    egui::Area::new(ui.id().with("ronin_completion_popup"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(anchor)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_max_width(280.0);
+                for (i, item) in items.iter().enumerate() {
+                    let selected = highlighted == Some(i);
+                    let text = format!("{}  {}", kind_glyph(item.kind), item.label);
+                    if selected {
+                        ui.label(egui::RichText::new(text).strong());
+                    } else {
+                        // Secondary to the literal: weak, low-emphasis rows.
+                        ui.weak(text);
+                    }
+                }
+            });
+        });
+}
+
+/// A short glyph hint for a completion kind (display-only).
+fn kind_glyph(kind: CompletionKind) -> &'static str {
+    match kind {
+        CompletionKind::Field => "f",
+        CompletionKind::Variant => "v",
+        CompletionKind::MapKey => "k",
+        CompletionKind::Option => "o",
+        CompletionKind::Delimiter => ".",
+    }
+}
+
+/// Convert a character offset into a byte offset within `buffer` (clamped).
+fn char_to_byte(buffer: &str, char_offset: usize) -> usize {
+    buffer
+        .char_indices()
+        .nth(char_offset)
+        .map_or(buffer.len(), |(b, _)| b)
+}
+
+/// Convert a byte offset into a character offset within `buffer` (clamped).
+fn byte_to_char(buffer: &str, byte_offset: usize) -> usize {
+    let clamped = byte_offset.min(buffer.len());
+    buffer[..clamped].chars().count()
+}
+
+/// Install a collapsed caret at `char_offset` into the live `TextEdit` state.
+fn set_caret(ui: &Ui, output: &TextEditOutput, char_offset: usize) {
+    let id = output.response.response.id;
+    let ctx = ui.ctx();
+    let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+    let cursor = CCursor::new(char_offset);
+    state.cursor.set_char_range(Some(CCursorRange::one(cursor)));
+    state.store(ctx, id);
 }
 
 /// Draw an underline squiggle beneath each diagnostic's character range (FR-008).

@@ -51,8 +51,10 @@ use crate::fileio::{open_path, save_bytes, save_document, OpenError, SaveError};
 use crate::panels::{mode_selector_seam_stub, tree_table_seam_stub};
 use crate::problems_panel::problems_panel;
 use crate::reparse::ReparseWorker;
-use crate::settings::{AppSettings, WindowGeometry};
+use crate::settings::{AppSettings, BlankLinePolicy, FormattingConfig, WindowGeometry};
+use crate::snippets::{SnippetSet, UserSnippetFile, USER_SNIPPET_TEMPLATE};
 use crate::workspace::{ClosedDocumentRecord, EditorWorkspace};
+use ron_core::{FormatResult, SyntaxKind, SyntaxNode};
 
 /// How long an informational (auto-dismiss) notice stays on screen.
 const INFO_NOTICE_TTL: Duration = Duration::from_secs(4);
@@ -203,6 +205,19 @@ pub struct App {
     /// Set once the user has confirmed a quit (no dirty doc, or after Save/Discard)
     /// so the next frame can close the viewport (FR-010 quit guard).
     quit_requested: bool,
+    /// Whether the Settings window is open (FR-007/FR-023). Toggled from the menu;
+    /// hosts the adjustable formatter controls (indent width, blank-line policy,
+    /// format-on-save).
+    show_settings: bool,
+    /// The effective snippet set: built-ins overlaid by the user file (FR-017).
+    ///
+    /// Loaded at construction from the OS config dir; a missing/malformed user file
+    /// degrades to built-ins-only and surfaces an explanatory notice (FR-017). The
+    /// trigger/menu lists these for discoverability (FR-025).
+    snippets: SnippetSet,
+    /// Whether the Snippets browser window is open (FR-025). Lists each effective
+    /// snippet's prefix + description and offers the open-user-file command.
+    show_snippets: bool,
 }
 
 impl App {
@@ -214,6 +229,9 @@ impl App {
     /// aborts (FR-003/FR-019).
     #[must_use]
     pub fn new(settings: AppSettings, cli_path: Option<PathBuf>) -> Self {
+        // Load the effective snippet set from the OS config dir; a missing/malformed
+        // user file degrades to built-ins and surfaces a notice below (FR-017).
+        let snippets = SnippetSet::load();
         let mut app = Self {
             workspace: EditorWorkspace::new(),
             worker: ReparseWorker::new(),
@@ -222,7 +240,12 @@ impl App {
             dirty_prompt: None,
             pending_batch: None,
             quit_requested: false,
+            show_settings: false,
+            snippets,
+            show_snippets: false,
         };
+        // Surface any snippet-file degrade notice once at startup (FR-017/FR-034).
+        app.surface_snippet_notice();
         if let Some(path) = cli_path {
             app.open_file(&path);
         }
@@ -328,6 +351,397 @@ impl App {
     #[must_use]
     pub fn notices(&self) -> &[Notice] {
         &self.notices
+    }
+
+    /// Push an explanatory authoring notice over the dismissible-notice channel
+    /// (FR-024).
+    ///
+    /// This is the smart-authoring surface's user-feedback path (E005): a format
+    /// no-op, a "no clean selection boundary", a "selection has parse errors", etc.
+    /// are reported here rather than via a blocking dialog. It reuses the existing
+    /// [`Notice`] / [`NoticeKind`] channel so behavior is uniform:
+    ///
+    /// * [`NoticeKind::Error`] — persists until the user dismisses it (a failure
+    ///   the user should see and acknowledge);
+    /// * [`NoticeKind::Info`] — auto-dismisses after the standard TTL (a transient
+    ///   "nothing to do" / "already formatted" status).
+    ///
+    /// It is NEVER a blocking modal — authoring feedback must not interrupt editing
+    /// (FR-024). Identical consecutive notices are de-duplicated so a repeated
+    /// command (e.g. Format again on an already-canonical document) does not stack
+    /// the same message.
+    pub fn push_authoring_notice(&mut self, kind: NoticeKind, message: impl Into<String>) {
+        let message = message.into();
+        // De-dupe: if the most recent live notice is identical, don't stack it.
+        if let Some(last) = self.notices.last() {
+            if last.kind == kind && last.message == message {
+                return;
+            }
+        }
+        let notice = match kind {
+            NoticeKind::Error => Notice::error(message),
+            NoticeKind::Info => Notice::info(message),
+        };
+        self.notices.push(notice);
+    }
+
+    /// The current formatter configuration (FR-007), read-only.
+    #[must_use]
+    pub fn formatting(&self) -> &FormattingConfig {
+        &self.settings.formatting
+    }
+
+    /// The current formatter configuration mutably (FR-007).
+    ///
+    /// Used by the settings surface to adjust indent width / blank-line policy /
+    /// format-on-save; changes are folded into [`AppSettings`] and persisted on the
+    /// next save tick (FR-016).
+    pub fn formatting_mut(&mut self) -> &mut FormattingConfig {
+        &mut self.settings.formatting
+    }
+
+    /// Whether the Settings window is currently open (for tests/hosts).
+    #[must_use]
+    pub fn settings_open(&self) -> bool {
+        self.show_settings
+    }
+
+    /// Open or close the Settings window (FR-023).
+    pub fn set_settings_open(&mut self, open: bool) {
+        self.show_settings = open;
+    }
+
+    /// The effective snippet set: built-ins overlaid by the user file (FR-017),
+    /// read-only for tests/hosts and the trigger UI.
+    #[must_use]
+    pub fn snippets(&self) -> &SnippetSet {
+        &self.snippets
+    }
+
+    /// Whether the Snippets browser window is open (for tests/hosts).
+    #[must_use]
+    pub fn snippets_open(&self) -> bool {
+        self.show_snippets
+    }
+
+    /// Open or close the Snippets browser window (FR-025).
+    pub fn set_snippets_open(&mut self, open: bool) {
+        self.show_snippets = open;
+    }
+
+    /// Reload the snippet set from the OS config dir and re-surface any degrade
+    /// notice (FR-017).
+    ///
+    /// Lets the user re-pick up an edited user file without restarting. A
+    /// missing/malformed file still leaves built-ins available; the explanatory
+    /// notice is pushed through the standard authoring-notice channel.
+    pub fn reload_snippets(&mut self) {
+        self.snippets = SnippetSet::load();
+        self.surface_snippet_notice();
+    }
+
+    /// Push the snippet set's degrade notice, if any, through the authoring channel
+    /// (FR-017/FR-024).
+    ///
+    /// A healthy set (built-ins only, or a clean user file) has no notice and pushes
+    /// nothing. A Malformed file (or dropped bad entries) surfaces an explanatory,
+    /// non-blocking error notice — built-ins always keep working.
+    fn surface_snippet_notice(&mut self) {
+        if let Some(message) = self.snippets.notice() {
+            self.push_authoring_notice(NoticeKind::Error, message.to_string());
+        }
+    }
+
+    /// The discoverability menu: `(prefix, description)` per effective snippet,
+    /// name-sorted (FR-025).
+    #[must_use]
+    pub fn snippet_menu_entries(&self) -> Vec<(String, String)> {
+        self.snippets.menu_entries()
+    }
+
+    /// The path the user snippet file is read from in the OS config dir (FR-025).
+    ///
+    /// `None` when the platform exposes no config directory.
+    #[must_use]
+    pub fn user_snippet_path(&self) -> Option<PathBuf> {
+        UserSnippetFile::location()
+    }
+
+    /// Open (and thereby locate) the user snippet file, creating it from a starter
+    /// template if absent (FR-025).
+    ///
+    /// Best-effort and non-blocking: it resolves the file location in the OS config
+    /// dir, writes the [`USER_SNIPPET_TEMPLATE`] starter when no file exists yet (so
+    /// the user lands in a valid example), then launches the OS default handler for
+    /// the file. Any failure (no config dir, write error, no opener) is surfaced as a
+    /// non-blocking error notice rather than crashing. Returns the resolved path on
+    /// success, `None` when no location could be determined.
+    pub fn open_user_snippet_file(&mut self) -> Option<PathBuf> {
+        let Some(path) = UserSnippetFile::location() else {
+            self.push_authoring_notice(
+                NoticeKind::Error,
+                "No OS config directory is available to store the user snippet file.",
+            );
+            return None;
+        };
+        // Create the file (and its parent dir) from the starter template if absent,
+        // so "open" always lands the user in an editable, valid example (FR-025).
+        if !path.exists() {
+            if let Some(parent) = path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    self.push_authoring_notice(
+                        NoticeKind::Error,
+                        format!("Could not create the snippet directory: {e}"),
+                    );
+                    return Some(path);
+                }
+            }
+            if let Err(e) = std::fs::write(&path, USER_SNIPPET_TEMPLATE) {
+                self.push_authoring_notice(
+                    NoticeKind::Error,
+                    format!("Could not create the user snippet file: {e}"),
+                );
+                return Some(path);
+            }
+        }
+        // Launch the OS default handler so the user can locate/edit the file. A
+        // failure here is informative, never fatal (the path is still returned).
+        if let Err(e) = open_in_os(&path) {
+            self.push_authoring_notice(
+                NoticeKind::Info,
+                format!("The user snippet file is at {} ({e})", path.display()),
+            );
+        }
+        Some(path)
+    }
+
+    /// Insert the snippet named `name` at the active document's caret, verifying the
+    /// expansion round-trips before committing (FR-016/FR-018).
+    ///
+    /// Looks up the snippet in the effective set, expands its body, and splices it at
+    /// the active caret through [`crate::snippets::insert_snippet`], which re-parses
+    /// the candidate buffer and refuses any splice that would introduce a new parse
+    /// error (verify-before-replace, project-instructions §I). On success the buffer
+    /// is replaced, the caret moves to the first tab-stop, the document is marked
+    /// dirty and a reparse is requested, and the live tab-stop session is installed
+    /// on the document for `editor_view` to drive. On a refusal (or no active
+    /// document / unknown name) a non-blocking notice explains and nothing changes.
+    /// Returns `true` when a snippet was inserted.
+    pub fn insert_snippet_by_name(&mut self, name: &str) -> bool {
+        let Some(snippet) = self.snippets.get(name) else {
+            return false;
+        };
+        let body = snippet.body.clone();
+        let Some(idx) = self.workspace.active_index() else {
+            self.push_authoring_notice(
+                NoticeKind::Info,
+                "Open a document before inserting a snippet.",
+            );
+            return false;
+        };
+        let Some(doc) = self.workspace.get(idx) else {
+            return false;
+        };
+        let caret = doc.cursor.caret.min(doc.char_len());
+        match crate::snippets::insert_snippet(&doc.buffer, caret, &body) {
+            Some(insertion) => {
+                let Some(doc) = self.workspace.get_mut(idx) else {
+                    return false;
+                };
+                doc.buffer = insertion.new_buffer;
+                // Move the caret to the first tab-stop (or leave it at the insertion
+                // when the snippet has no stops).
+                if let Some(c) = insertion.session.caret() {
+                    doc.cursor.caret = c;
+                    doc.cursor.selection = insertion.session.selection();
+                }
+                doc.snippet_session = Some(insertion.session);
+                doc.on_edit();
+                doc.request_reparse(&self.worker);
+                true
+            }
+            None => {
+                self.push_authoring_notice(
+                    NoticeKind::Error,
+                    "Snippet insertion skipped: the result would not parse.",
+                );
+                false
+            }
+        }
+    }
+
+    /// Format the active document (FR-001/FR-023).
+    ///
+    /// Parses the active buffer with `ron_core::parse`, runs `ron_core::format`
+    /// against the live [`FormattingConfig`], and routes the outcome through the
+    /// single safe apply path ([`apply_whole_document_format`](Self::apply_whole_document_format)):
+    ///
+    /// * [`FormatResult::Formatted`] → the active buffer is replaced with the
+    ///   canonical text (marked dirty, reparse triggered) **only** when it actually
+    ///   differs; an already-canonical document reports a non-error "already
+    ///   formatted" status and leaves the bytes untouched.
+    /// * [`FormatResult::NoOp`] → the document is left **byte-unchanged** and the
+    ///   formatter's explanatory reason is surfaced as a persist-until-dismissed
+    ///   error notice (FR-005/FR-021).
+    ///
+    /// The formatter performs verify-before-replace + no-op-on-failure internally
+    /// (AD-008); the buffer is therefore replaced only on `Formatted`, never on a
+    /// failure path. With no document open this is a harmless no-op.
+    pub fn format_document(&mut self) {
+        let Some(idx) = self.workspace.active_index() else {
+            return;
+        };
+        let Some(doc) = self.workspace.get(idx) else {
+            return;
+        };
+        let config = self.settings.formatting.to_engine_config();
+        let parsed = ron_core::parse(&doc.buffer);
+        let result = ron_core::format(&parsed, &config);
+        self.apply_whole_document_format(idx, result);
+    }
+
+    /// Format the current selection's smallest enclosing CST subtree (FR-002/FR-023).
+    ///
+    /// Maps the active document's character-offset selection to its byte range,
+    /// parses the buffer, and walks the CST for the **smallest enclosing
+    /// value-position node** that fully covers the selection. `ron_core::format_node`
+    /// then produces the canonical text for just that subtree, which is spliced back
+    /// over the node's exact source range — the rest of the buffer stays
+    /// byte-unchanged (FR-023). The outcome goes through the same single safe apply
+    /// path as Format Document:
+    ///
+    /// * [`FormatResult::Formatted`] → only the node's range is replaced (dirty +
+    ///   reparse), and only when it actually changed; an already-canonical subtree
+    ///   reports a non-error status with no byte change.
+    /// * [`FormatResult::NoOp`] → byte-unchanged + a persist-until-dismissed error
+    ///   notice (FR-005/FR-021).
+    ///
+    /// When there is **no active selection**, this falls back to
+    /// [`format_document`](Self::format_document) (formatting the whole buffer) so
+    /// the command is never a silent dead-end. When the selection has no clean
+    /// subtree boundary the formatter's reason is surfaced and nothing changes.
+    pub fn format_selection(&mut self) {
+        let Some(idx) = self.workspace.active_index() else {
+            return;
+        };
+        let Some(doc) = self.workspace.get(idx) else {
+            return;
+        };
+        // No selection → format the whole document (never a silent no-op).
+        let Some((anchor, head)) = doc.cursor.selection else {
+            self.format_document();
+            return;
+        };
+        // An empty (caret-only) selection has no subtree to act on → whole document.
+        if anchor == head {
+            self.format_document();
+            return;
+        }
+        let (char_start, char_end) = (anchor.min(head), anchor.max(head));
+        // Map the char-offset selection to byte offsets into the live buffer.
+        let Some((byte_start, byte_end)) = char_range_to_bytes(&doc.buffer, char_start, char_end)
+        else {
+            self.push_authoring_notice(
+                NoticeKind::Error,
+                "Could not map the selection to the buffer; formatting skipped.",
+            );
+            return;
+        };
+        let config = self.settings.formatting.to_engine_config();
+        let parsed = ron_core::parse(&doc.buffer);
+        let Some(node) = smallest_enclosing_value_node(&parsed, byte_start, byte_end) else {
+            self.push_authoring_notice(
+                NoticeKind::Error,
+                "No clean subtree boundary at the selection; formatting skipped.",
+            );
+            return;
+        };
+        let node_range = node.text_range();
+        let result = ron_core::format_node(&node, &config);
+        self.apply_selection_format(idx, node_range.start(), node_range.end(), result);
+    }
+
+    /// The single safe apply path for a whole-document format outcome (T016).
+    ///
+    /// Centralizes the verify-before-replace contract at the app boundary: the
+    /// buffer is replaced **only** on [`FormatResult::Formatted`], and even then
+    /// only when the canonical text actually differs from the current buffer (so a
+    /// re-run on an already-canonical document is idempotent and never marks it
+    /// dirty). On [`FormatResult::NoOp`] the document is left byte-unchanged and the
+    /// reason is surfaced as an error notice (FR-005/FR-021).
+    fn apply_whole_document_format(&mut self, idx: usize, result: FormatResult) {
+        match result {
+            FormatResult::Formatted(text) => {
+                let Some(doc) = self.workspace.get_mut(idx) else {
+                    return;
+                };
+                if doc.buffer == text {
+                    self.push_authoring_notice(NoticeKind::Info, "Document is already formatted.");
+                    return;
+                }
+                doc.buffer = text;
+                doc.on_edit();
+                doc.request_reparse(&self.worker);
+            }
+            FormatResult::NoOp { reason } => {
+                self.push_authoring_notice(NoticeKind::Error, format!("Format skipped: {reason}"));
+            }
+        }
+    }
+
+    /// The single safe apply path for a Format-Selection outcome (T016).
+    ///
+    /// Splices the formatted subtree text over `[byte_start, byte_end)` of the
+    /// active buffer, leaving the rest byte-unchanged. As with
+    /// [`apply_whole_document_format`](Self::apply_whole_document_format) the buffer
+    /// is touched **only** on [`FormatResult::Formatted`] and only when the spliced
+    /// result actually differs from the current buffer; a [`FormatResult::NoOp`]
+    /// leaves the document unchanged and surfaces the reason as an error notice
+    /// (FR-005/FR-021). The byte bounds come from the matched CST node's range, so
+    /// they always fall on UTF-8 boundaries within the buffer the parse ran on.
+    fn apply_selection_format(
+        &mut self,
+        idx: usize,
+        byte_start: usize,
+        byte_end: usize,
+        result: FormatResult,
+    ) {
+        match result {
+            FormatResult::Formatted(text) => {
+                let Some(doc) = self.workspace.get_mut(idx) else {
+                    return;
+                };
+                // Defensive bounds + UTF-8-boundary check: the range came from a CST
+                // node parsed from this exact buffer, but never splice on a non-char
+                // boundary or out of range (would panic / corrupt) — no-op instead.
+                if byte_end > doc.buffer.len()
+                    || byte_start > byte_end
+                    || !doc.buffer.is_char_boundary(byte_start)
+                    || !doc.buffer.is_char_boundary(byte_end)
+                {
+                    self.push_authoring_notice(
+                        NoticeKind::Error,
+                        "Format skipped: selection range no longer maps to the buffer.",
+                    );
+                    return;
+                }
+                let mut next =
+                    String::with_capacity(doc.buffer.len() - (byte_end - byte_start) + text.len());
+                next.push_str(&doc.buffer[..byte_start]);
+                next.push_str(&text);
+                next.push_str(&doc.buffer[byte_end..]);
+                if doc.buffer == next {
+                    self.push_authoring_notice(NoticeKind::Info, "Selection is already formatted.");
+                    return;
+                }
+                doc.buffer = next;
+                doc.on_edit();
+                doc.request_reparse(&self.worker);
+            }
+            FormatResult::NoOp { reason } => {
+                self.push_authoring_notice(NoticeKind::Error, format!("Format skipped: {reason}"));
+            }
+        }
     }
 
     /// Open `path` as a new active tab, focusing an existing tab if the same file
@@ -441,14 +855,62 @@ impl App {
         self.save_doc_to(idx, &target)
     }
 
+    /// Apply opt-in format-on-save to document `idx`'s in-memory buffer (FR-006).
+    ///
+    /// A no-op unless [`FormattingConfig::format_on_save`] is set. When enabled it
+    /// formats the live buffer (the same engine path Format Document uses) **before**
+    /// the caller writes bytes:
+    ///
+    /// * [`FormatResult::Formatted`] → the buffer is updated to the canonical text
+    ///   (when it differs) and the reparse trigger fires, so what is written to disk
+    ///   and what the views show stay consistent.
+    /// * [`FormatResult::NoOp`] → the buffer is left **byte-unchanged**, an info
+    ///   notice explains that formatting was skipped, and the save proceeds with the
+    ///   original bytes. Format-on-save must NEVER block a save or corrupt the file
+    ///   (project-instructions §I), so a formatter decline only informs, never aborts.
+    fn maybe_format_on_save(&mut self, idx: usize) {
+        if !self.settings.formatting.format_on_save {
+            return;
+        }
+        let Some(doc) = self.workspace.get(idx) else {
+            return;
+        };
+        let config = self.settings.formatting.to_engine_config();
+        let parsed = ron_core::parse(&doc.buffer);
+        match ron_core::format(&parsed, &config) {
+            FormatResult::Formatted(text) => {
+                let Some(doc) = self.workspace.get_mut(idx) else {
+                    return;
+                };
+                if doc.buffer != text {
+                    doc.buffer = text;
+                    doc.on_edit();
+                    doc.request_reparse(&self.worker);
+                }
+            }
+            FormatResult::NoOp { reason } => {
+                // Do not block the save; inform and write the buffer as-is.
+                self.push_authoring_notice(
+                    NoticeKind::Info,
+                    format!("Format on save skipped: {reason}"),
+                );
+            }
+        }
+    }
+
     /// Write document `idx` to `path`, refresh its identity, and clear dirty.
     ///
     /// Shared by Save and Save As (and tests, since it sidesteps the `rfd` dialog):
+    /// runs opt-in format-on-save **before** the byte-write (FR-006, AD-005), then
     /// writes via [`save_document`], and on success sets the document's path,
     /// refreshes its byte-fidelity profile from the bytes actually written, and
     /// marks it saved. On failure pushes an error notice and keeps the doc dirty.
     /// Returns `true` only on a successful write.
     pub fn save_doc_to(&mut self, idx: usize, path: &Path) -> bool {
+        // Opt-in format-on-save runs on the in-memory buffer first, so the formatted
+        // text is what reaches disk (FR-006). It NEVER blocks or fails the save: on a
+        // formatter no-op/failure the buffer is saved as-is and a notice is surfaced.
+        self.maybe_format_on_save(idx);
         let Some(doc) = self.workspace.get_mut(idx) else {
             return false;
         };
@@ -914,8 +1376,79 @@ impl App {
                         }
                     });
                     ui.separator();
+                    if ui.button("Settings\u{2026}").clicked() {
+                        self.show_settings = true;
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button("Quit").clicked() {
                         self.request_quit();
+                        ui.close();
+                    }
+                });
+                // Format menu (FR-001/FR-002/FR-023): Format Document / Format
+                // Selection. Both invoke the real `ron_core` formatter through the
+                // shell's single safe apply path (buffer replaced only on a
+                // verified `Formatted` result; `NoOp` surfaces an error notice and
+                // changes nothing). Both are disabled only when no tab is open so the
+                // menu shape stays stable.
+                ui.menu_button("Format", |ui| {
+                    let has_active = self.active_document().is_some();
+                    ui.add_enabled_ui(has_active, |ui| {
+                        if ui.button("Format Document").clicked() {
+                            self.format_document();
+                            ui.close();
+                        }
+                        if ui.button("Format Selection").clicked() {
+                            self.format_selection();
+                            ui.close();
+                        }
+                    });
+                });
+                // Snippets menu (FR-015/FR-025): each effective snippet is listed by
+                // its prefix + description (discoverability), insertable into the
+                // active document via the explicit trigger; plus a Browse window and
+                // the open/locate-user-file command. Snippet insertion is verified to
+                // round-trip before it touches the buffer (FR-018).
+                ui.menu_button("Snippets", |ui| {
+                    let has_active = self.active_document().is_some();
+                    // Snapshot the (name, prefix, description) triples so the menu can
+                    // render while we later mutate the document on a click.
+                    let entries: Vec<(String, String, String)> = self
+                        .snippets
+                        .iter()
+                        .map(|s| (s.name.clone(), s.prefix.clone(), s.description.clone()))
+                        .collect();
+                    ui.add_enabled_ui(has_active, |ui| {
+                        let mut insert: Option<String> = None;
+                        egui::ScrollArea::vertical()
+                            .max_height(360.0)
+                            .show(ui, |ui| {
+                                for (name, prefix, description) in &entries {
+                                    if ui
+                                        .button(format!("{prefix}  \u{2014}  {description}"))
+                                        .clicked()
+                                    {
+                                        insert = Some(name.clone());
+                                    }
+                                }
+                            });
+                        if let Some(name) = insert {
+                            self.insert_snippet_by_name(&name);
+                            ui.close();
+                        }
+                    });
+                    ui.separator();
+                    if ui.button("Browse Snippets\u{2026}").clicked() {
+                        self.show_snippets = true;
+                        ui.close();
+                    }
+                    if ui.button("Open User Snippet File\u{2026}").clicked() {
+                        self.open_user_snippet_file();
+                        ui.close();
+                    }
+                    if ui.button("Reload Snippets").clicked() {
+                        self.reload_snippets();
                         ui.close();
                     }
                 });
@@ -1154,6 +1687,150 @@ impl App {
         }
     }
 
+    /// Render the Settings window when open, with the adjustable formatter
+    /// controls (FR-007/FR-023).
+    ///
+    /// A non-modal, dismissible window (never blocks editing). It exposes the three
+    /// formatter knobs — indent width (clamped `1..=16`), blank-line policy, and the
+    /// format-on-save toggle — bound directly to [`AppSettings::formatting`], so a
+    /// change is folded into settings and persisted on the next save tick (FR-016).
+    fn render_settings_window(&mut self, ui: &mut egui::Ui) {
+        if !self.show_settings {
+            return;
+        }
+        let mut open = self.show_settings;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ui.ctx(), |ui| {
+                ui.heading("Formatting");
+                ui.add_space(4.0);
+
+                let fmt = &mut self.settings.formatting;
+
+                // Indent width — clamped to the sane range by the widget bounds and,
+                // belt-and-suspenders, by `set_indent_width` on read.
+                ui.horizontal(|ui| {
+                    ui.label("Indent width");
+                    let mut width = fmt.indent_width;
+                    if ui
+                        .add(egui::Slider::new(
+                            &mut width,
+                            FormattingConfig::min_indent_width()
+                                ..=FormattingConfig::max_indent_width(),
+                        ))
+                        .changed()
+                    {
+                        fmt.set_indent_width(width);
+                    }
+                });
+
+                // Blank-line policy.
+                ui.horizontal(|ui| {
+                    ui.label("Blank lines");
+                    egui::ComboBox::from_id_salt("blank_line_policy")
+                        .selected_text(match fmt.blank_line_policy {
+                            BlankLinePolicy::Collapse => "Collapse to one",
+                            BlankLinePolicy::Preserve => "Preserve",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut fmt.blank_line_policy,
+                                BlankLinePolicy::Collapse,
+                                "Collapse to one",
+                            );
+                            ui.selectable_value(
+                                &mut fmt.blank_line_policy,
+                                BlankLinePolicy::Preserve,
+                                "Preserve",
+                            );
+                        });
+                });
+
+                // Format-on-save toggle.
+                ui.checkbox(&mut fmt.format_on_save, "Format on save");
+
+                ui.add_space(6.0);
+                ui.weak("Run Format \u{25B8} Format Document or Format Selection from the menu.");
+            });
+        self.show_settings = open;
+    }
+
+    /// Render the Snippets browser window when open (FR-025).
+    ///
+    /// A non-modal, dismissible window listing every effective snippet by its prefix
+    /// and description (discoverability), with an Insert button (active document
+    /// only) that routes through the round-trip-verified insertion path, plus the
+    /// open/locate-user-file and reload commands. Never blocks editing.
+    fn render_snippets_window(&mut self, ui: &mut egui::Ui) {
+        if !self.show_snippets {
+            return;
+        }
+        let mut open = self.show_snippets;
+        let has_active = self.active_document().is_some();
+        // Snapshot so the window can render while a click later mutates the document.
+        let entries: Vec<(String, String, String)> = self
+            .snippets
+            .iter()
+            .map(|s| (s.name.clone(), s.prefix.clone(), s.description.clone()))
+            .collect();
+        let path_label = self.user_snippet_path().map_or_else(
+            || "(no config dir)".to_string(),
+            |p| p.display().to_string(),
+        );
+
+        let mut insert: Option<String> = None;
+        let mut open_file = false;
+        let mut reload = false;
+        egui::Window::new("Snippets")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ui.ctx(), |ui| {
+                ui.label("Available snippets (built-in + user):");
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for (name, prefix, description) in &entries {
+                            ui.horizontal(|ui| {
+                                ui.add_enabled_ui(has_active, |ui| {
+                                    if ui.button("Insert").clicked() {
+                                        insert = Some(name.clone());
+                                    }
+                                });
+                                ui.monospace(prefix);
+                                ui.weak(description);
+                            });
+                        }
+                    });
+                ui.separator();
+                ui.weak(format!("User file: {path_label}"));
+                ui.horizontal(|ui| {
+                    if ui.button("Open User Snippet File\u{2026}").clicked() {
+                        open_file = true;
+                    }
+                    if ui.button("Reload").clicked() {
+                        reload = true;
+                    }
+                });
+            });
+        self.show_snippets = open;
+        if let Some(name) = insert {
+            self.insert_snippet_by_name(&name);
+        }
+        if open_file {
+            self.open_user_snippet_file();
+        }
+        if reload {
+            self.reload_snippets();
+        }
+    }
+
     /// Render the reserved mode-selector seam in the top region (FR-013).
     ///
     /// Mounts [`mode_selector_seam_stub`] (reserved for **E009**) as its own top
@@ -1210,6 +1887,10 @@ impl App {
         self.render_central(ui);
         // The unsaved-changes prompt floats above everything when open.
         self.render_dirty_prompt(ui);
+        // The Settings window floats above everything when open (FR-007/FR-023).
+        self.render_settings_window(ui);
+        // The Snippets browser floats above everything when open (FR-025).
+        self.render_snippets_window(ui);
     }
 }
 
@@ -1309,6 +1990,45 @@ fn display_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// Launch the OS default handler for `path` (the snippet open-file command, FR-025).
+///
+/// Uses the platform's "open with default app" command (`cmd /c start` on Windows,
+/// `open` on macOS, `xdg-open` elsewhere). Best-effort: a non-zero exit or a missing
+/// opener is reported as an error so the caller can fall back to showing the path.
+/// Never executes any user RON (project-instructions §VI) — it only hands the file
+/// path to the OS shell to open in the user's editor of choice.
+fn open_in_os(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        // `start` is a cmd builtin; the empty "" is the (ignored) window title so a
+        // quoted path is not mistaken for one.
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", ""]).arg(path);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(path);
+        c
+    };
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(path);
+        c
+    };
+
+    let status = cmd.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "opener exited with status {status}"
+        )))
+    }
+}
+
 /// Canonicalize `path`, falling back to its raw form when canonicalization fails
 /// (FR-025).
 ///
@@ -1318,4 +2038,94 @@ fn display_name(path: &std::path::Path) -> String {
 /// matching still works by literal equality.
 fn canonicalize_or_raw(path: &std::path::Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Map a `[char_start, char_end)` selection to absolute byte offsets in `buffer`
+/// (FR-002).
+///
+/// The editor surface tracks the selection in **character** offsets (encoding-width
+/// independent), while the `ron-core` CST works in **byte** offsets; Format
+/// Selection must bridge the two. Returns `None` only when an offset falls past the
+/// buffer's character count (a stale selection), so the caller can decline rather
+/// than splice on a bogus range. `char_end == char_len` maps to `buffer.len()`.
+fn char_range_to_bytes(buffer: &str, char_start: usize, char_end: usize) -> Option<(usize, usize)> {
+    let mut byte_start: Option<usize> = None;
+    let mut byte_end: Option<usize> = None;
+    // `char_indices` yields (byte_offset, char) in order; the char *count* index `i`
+    // maps to that char's starting byte offset. The end-of-buffer index maps to len.
+    for (i, (byte, _)) in buffer.char_indices().enumerate() {
+        if i == char_start {
+            byte_start = Some(byte);
+        }
+        if i == char_end {
+            byte_end = Some(byte);
+        }
+    }
+    let char_len = buffer.chars().count();
+    if char_start == char_len {
+        byte_start = Some(buffer.len());
+    }
+    if char_end == char_len {
+        byte_end = Some(buffer.len());
+    }
+    match (byte_start, byte_end) {
+        (Some(s), Some(e)) if s <= e => Some((s, e)),
+        _ => None,
+    }
+}
+
+/// Find the smallest CST value-position node fully enclosing `[byte_start, byte_end)`
+/// (FR-002/FR-023).
+///
+/// Walks the parsed CST from the root, descending into the deepest child whose byte
+/// range fully covers the selection, and returns the smallest such node whose kind is
+/// a clean subtree boundary for `ron_core::format_node` (a struct / tuple / list /
+/// map / enum-variant / unit / literal). When the smallest covering node is not itself
+/// a value node (e.g. a bare `StructField` or `MapEntry`), the nearest enclosing value
+/// ancestor is returned instead, so a selection landing inside a field still maps to a
+/// formattable subtree. Returns `None` when no value node covers the selection (the
+/// caller then declines and notifies).
+fn smallest_enclosing_value_node(
+    doc: &ron_core::CstDocument,
+    byte_start: usize,
+    byte_end: usize,
+) -> Option<SyntaxNode> {
+    let mut node = doc.root();
+    // Descend greedily into the deepest child that still fully covers the selection.
+    loop {
+        let next = node.children().find(|child| {
+            let r = child.text_range();
+            r.start() <= byte_start && byte_end <= r.end()
+        });
+        match next {
+            Some(child) => node = child,
+            None => break,
+        }
+    }
+    // `node` is now the smallest node covering the selection. Climb to the nearest
+    // value-position ancestor (including `node` itself) so `format_node` gets a clean
+    // subtree boundary.
+    let mut candidate = Some(node);
+    while let Some(n) = candidate {
+        if is_value_node_kind(n.kind()) {
+            return Some(n);
+        }
+        candidate = n.parent();
+    }
+    None
+}
+
+/// Whether `kind` is a value-position node kind accepted by `ron_core::format_node`
+/// as a clean Format-Selection subtree boundary.
+fn is_value_node_kind(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::Struct
+            | SyntaxKind::Tuple
+            | SyntaxKind::List
+            | SyntaxKind::Map
+            | SyntaxKind::EnumVariant
+            | SyntaxKind::Unit
+            | SyntaxKind::Literal
+    )
 }

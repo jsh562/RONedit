@@ -22,6 +22,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::completion::CompletionState;
 use crate::diagnostics_map::{map_diagnostic, DiagnosticView};
 use crate::editor_view::build_highlight_model;
 use crate::reparse::{ParseResult, ReparseWorker};
@@ -289,6 +290,21 @@ pub struct EditorDocument {
     /// character length when consumed, so navigation never lands out of bounds
     /// even if the buffer shrank since the diagnostic was produced.
     pending_cursor_jump: Option<usize>,
+    /// The structural-autocomplete popup state for this document (E005 Wave 3).
+    ///
+    /// Cross-frame state for the custom completion popup `editor_view` renders over
+    /// the editor: open/closed, the candidate items, the explicitly-highlighted
+    /// index (never preselected), and the trigger offset. Recomputed from the live
+    /// buffer + caret each frame; default is closed.
+    pub completion: CompletionState,
+    /// The live snippet tab-stop navigation session, when one is in progress (E005
+    /// Wave 4, FR-016).
+    ///
+    /// Set when a snippet is inserted (the buffer is spliced and the caret jumps to
+    /// the first tab-stop); `editor_view` drives `Tab`/`Shift+Tab` over it and clears
+    /// it once navigation ends (`$0` reached, `Esc`, or the buffer edited out from
+    /// under it). `None` when no snippet navigation is active.
+    pub snippet_session: Option<crate::snippets::SnippetSession>,
 }
 
 impl EditorDocument {
@@ -324,6 +340,8 @@ impl EditorDocument {
             edit_generation: 0,
             last_requested_generation: 0,
             pending_cursor_jump: None,
+            completion: CompletionState::new(),
+            snippet_session: None,
         })
     }
 
@@ -355,6 +373,8 @@ impl EditorDocument {
             edit_generation: 0,
             last_requested_generation: 0,
             pending_cursor_jump: None,
+            completion: CompletionState::new(),
+            snippet_session: None,
         }
     }
 
@@ -390,6 +410,8 @@ impl EditorDocument {
             edit_generation: 0,
             last_requested_generation: 0,
             pending_cursor_jump: None,
+            completion: CompletionState::new(),
+            snippet_session: None,
         }
     }
 

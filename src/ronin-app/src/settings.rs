@@ -33,6 +33,30 @@ const DEFAULT_LARGE_FILE_THRESHOLD: u64 = 5_242_880;
 /// hand-edited settings file can never push the effective threshold below it.
 const MIN_LARGE_FILE_THRESHOLD: u64 = 65_536;
 
+/// Default indent width for the formatter: 4 spaces (FR-007).
+const DEFAULT_INDENT_WIDTH: u32 = 4;
+
+/// Sane minimum / maximum indent width (FR-007). A hand-edited settings file
+/// specifying an absurd indent width is clamped to this range on load and via the
+/// setter, mirroring `ron_core::FormatConfig`'s own clamp so the two never diverge.
+const MIN_INDENT_WIDTH: u32 = 1;
+const MAX_INDENT_WIDTH: u32 = 16;
+
+/// How the formatter treats runs of blank lines between elements (FR-007).
+///
+/// Mirrors `ron_core::BlankLinePolicy`; kept as its own type so `ronin-app` does
+/// not leak the engine enum into its persisted settings schema (and so the JSON
+/// representation is owned here). [`FormattingConfig::to_engine_config`] maps it to
+/// the engine value when a format is actually invoked (Wave 2).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlankLinePolicy {
+    /// Collapse any run of blank lines to at most one (the default).
+    #[default]
+    Collapse,
+    /// Preserve the original blank-line count between elements.
+    Preserve,
+}
+
 /// Saved window position and size (logical pixels).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct WindowGeometry {
@@ -52,6 +76,77 @@ impl Default for WindowGeometry {
     }
 }
 
+/// Formatter configuration persisted with the app settings (FR-007).
+///
+/// The formatter-facing knobs the user can adjust on the settings surface: the
+/// indent width, the blank-line policy, and whether to format automatically on
+/// save. Mirrors `ron_core::FormatConfig` (the engine value type) plus the
+/// surface-only `format_on_save` flag. Robustness contract (project-instructions
+/// §I): an absent or corrupt on-disk value falls back to the defaults and an
+/// out-of-range indent width is clamped — a hand-edited settings file can never
+/// produce an unusable formatter config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FormattingConfig {
+    /// Spaces of indent per nesting depth (default 4, clamped to `1..=16`).
+    pub indent_width: u32,
+    /// How runs of blank lines are treated (default [`BlankLinePolicy::Collapse`]).
+    pub blank_line_policy: BlankLinePolicy,
+    /// When `true`, the document is formatted automatically on every save
+    /// (default `false`). Wired into the save path in Wave 2.
+    pub format_on_save: bool,
+}
+
+impl Default for FormattingConfig {
+    fn default() -> Self {
+        Self {
+            indent_width: DEFAULT_INDENT_WIDTH,
+            blank_line_policy: BlankLinePolicy::default(),
+            format_on_save: false,
+        }
+    }
+}
+
+impl FormattingConfig {
+    /// The indent width clamped to the sane `1..=16` range (FR-007).
+    ///
+    /// Read formatter config through this rather than the raw field so a corrupt /
+    /// hand-edited value can never push the effective indent out of range.
+    #[must_use]
+    pub fn effective_indent_width(&self) -> u32 {
+        self.indent_width.clamp(MIN_INDENT_WIDTH, MAX_INDENT_WIDTH)
+    }
+
+    /// Set the indent width, clamping to the sane `1..=16` range (FR-007).
+    pub fn set_indent_width(&mut self, width: u32) {
+        self.indent_width = width.clamp(MIN_INDENT_WIDTH, MAX_INDENT_WIDTH);
+    }
+
+    /// The smallest permitted indent width (1).
+    #[must_use]
+    pub const fn min_indent_width() -> u32 {
+        MIN_INDENT_WIDTH
+    }
+
+    /// The largest permitted indent width (16).
+    #[must_use]
+    pub const fn max_indent_width() -> u32 {
+        MAX_INDENT_WIDTH
+    }
+
+    /// Build the `ron-core` [`FormatConfig`](ron_core::FormatConfig) this surface
+    /// config maps to (the engine value used when a format is actually invoked,
+    /// Wave 2). The engine clamps the indent width too, so the two stay in sync.
+    #[must_use]
+    pub fn to_engine_config(&self) -> ron_core::FormatConfig {
+        let policy = match self.blank_line_policy {
+            BlankLinePolicy::Collapse => ron_core::BlankLinePolicy::Collapse,
+            BlankLinePolicy::Preserve => ron_core::BlankLinePolicy::Preserve,
+        };
+        ron_core::FormatConfig::new(self.effective_indent_width(), policy)
+    }
+}
+
 /// User-facing application settings persisted between sessions (FR-016).
 ///
 /// Deliberately excludes any session/document state. Unknown fields in an older
@@ -66,6 +161,9 @@ pub struct AppSettings {
     pub preferences: BTreeMap<String, String>,
     /// Files larger than this many bytes trigger the large-file warning path.
     pub large_file_threshold: u64,
+    /// Formatter configuration (FR-007): indent width, blank-line policy, and the
+    /// format-on-save toggle. Defaults on absent / corrupt (serde `default`).
+    pub formatting: FormattingConfig,
 }
 
 impl Default for AppSettings {
@@ -74,6 +172,7 @@ impl Default for AppSettings {
             window_geometry: None,
             preferences: BTreeMap::new(),
             large_file_threshold: DEFAULT_LARGE_FILE_THRESHOLD,
+            formatting: FormattingConfig::default(),
         }
     }
 }
@@ -107,6 +206,9 @@ impl AppSettings {
         // Enforce the FR-017 floor: a settings file specifying an absurdly small
         // threshold must not be able to degrade ordinary files.
         settings.large_file_threshold = settings.large_file_threshold.max(MIN_LARGE_FILE_THRESHOLD);
+        // Enforce the FR-007 indent clamp on load so a hand-edited / corrupt indent
+        // width can never push the effective formatter config out of range.
+        settings.formatting.indent_width = settings.formatting.effective_indent_width();
         settings
     }
 
@@ -223,6 +325,86 @@ mod tests {
         s.set_large_file_threshold(2_000_000);
         assert_eq!(s.large_file_threshold, 2_000_000);
         assert_eq!(s.effective_large_file_threshold(), 2_000_000);
+    }
+
+    #[test]
+    fn formatting_config_defaults() {
+        let f = FormattingConfig::default();
+        assert_eq!(f.indent_width, 4);
+        assert_eq!(f.blank_line_policy, BlankLinePolicy::Collapse);
+        assert!(!f.format_on_save);
+        // The default app settings embed the default formatting config.
+        assert_eq!(
+            AppSettings::default().formatting,
+            FormattingConfig::default()
+        );
+    }
+
+    #[test]
+    fn formatting_config_clamps_indent_width() {
+        let mut f = FormattingConfig::default();
+        f.set_indent_width(0);
+        assert_eq!(f.indent_width, FormattingConfig::min_indent_width());
+        f.set_indent_width(999);
+        assert_eq!(f.indent_width, FormattingConfig::max_indent_width());
+        f.set_indent_width(8);
+        assert_eq!(f.indent_width, 8);
+        assert_eq!(f.effective_indent_width(), 8);
+    }
+
+    #[test]
+    fn load_from_clamps_absurd_indent_width() {
+        let dir = std::env::temp_dir().join("ronin_settings_fmt_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("indent.json");
+        std::fs::write(&path, br#"{"formatting": {"indent_width": 9999}}"#).unwrap();
+        let loaded = AppSettings::load_from(&path);
+        assert_eq!(
+            loaded.formatting.indent_width,
+            FormattingConfig::max_indent_width()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_from_uses_formatting_defaults_when_absent() {
+        // An older settings file with no `formatting` block loads with the defaults
+        // (serde `default`), never a parse error (project-instructions §I).
+        let dir = std::env::temp_dir().join("ronin_settings_fmt_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("absent.json");
+        std::fs::write(&path, br#"{"large_file_threshold": 1048576}"#).unwrap();
+        let loaded = AppSettings::load_from(&path);
+        assert_eq!(loaded.formatting, FormattingConfig::default());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn formatting_round_trips_through_save_and_load() {
+        let dir = std::env::temp_dir().join("ronin_settings_fmt_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("roundtrip.json");
+        let mut s = AppSettings::default();
+        s.formatting.set_indent_width(2);
+        s.formatting.blank_line_policy = BlankLinePolicy::Preserve;
+        s.formatting.format_on_save = true;
+        s.save_to(&path).unwrap();
+        let loaded = AppSettings::load_from(&path);
+        assert_eq!(loaded.formatting, s.formatting);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn formatting_maps_to_engine_config() {
+        let mut f = FormattingConfig::default();
+        f.set_indent_width(2);
+        f.blank_line_policy = BlankLinePolicy::Preserve;
+        let engine = f.to_engine_config();
+        assert_eq!(engine.indent_width(), 2);
+        assert_eq!(
+            engine.blank_line_policy(),
+            ron_core::BlankLinePolicy::Preserve
+        );
     }
 
     #[test]
