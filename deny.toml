@@ -35,6 +35,11 @@ allow = [
     # MIT-0 — borrow-or-share (via fluent-uri → referencing → jsonschema).
     # MIT No Attribution; OSI-approved, strictly more permissive than MIT.
     "MIT-0",
+    # E007 atomic-write dependency (ronin-app only): `atomicwrites` and its
+    # transitive deps (tempfile, fastrand, getrandom, once_cell, cfg-if, and the
+    # windows-sys/windows-targets/windows_x86_64_msvc/windows-link tree) are ALL
+    # MIT / Apache-2.0 — already covered by the allow-list above, so no NEW
+    # license entry is required. Listed here only to document the audit.
 ]
 confidence-threshold = 0.8
 

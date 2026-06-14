@@ -42,6 +42,52 @@ const DEFAULT_INDENT_WIDTH: u32 = 4;
 const MIN_INDENT_WIDTH: u32 = 1;
 const MAX_INDENT_WIDTH: u32 = 16;
 
+// --- E007 non-destructive-persistence NEW-CONFIG (TR-024/025/026/027) -------
+//
+// Undo-history cap, autosave debounce, and the undo coalesce window. Each knob
+// is clamped on load and via its setter to a sane range so a corrupt / out-of-
+// range / hand-edited settings file can NEVER disable the bound, the debounce,
+// or coalescing (it falls back to the default or the nearest range edge, never
+// "off"; TR-026). The undo cap defaults mirror `ron_core::undo`'s constants so
+// the two never diverge.
+
+/// Default undo-history unit-count cap: 200 units (TR-024).
+const DEFAULT_UNDO_COUNT_CAP: usize = 200;
+/// Sane range for the undo unit-count cap: `1..=10_000` (TR-024). Never 0 (0
+/// would disable undo entirely) and never unbounded.
+const MIN_UNDO_COUNT_CAP: usize = 1;
+const MAX_UNDO_COUNT_CAP: usize = 10_000;
+
+/// Default undo-history byte-size cap: 64 MiB (TR-024).
+const DEFAULT_UNDO_BYTE_CAP: usize = 64 * 1024 * 1024;
+/// Sane range for the undo byte-size cap: 1 MiB..=1 GiB (TR-024).
+const MIN_UNDO_BYTE_CAP: usize = 1024 * 1024;
+const MAX_UNDO_BYTE_CAP: usize = 1024 * 1024 * 1024;
+
+/// Default autosave idle debounce: 4 s (TR-025). After this much idle time on a
+/// dirty+changed buffer the recovery sidecar is written.
+const DEFAULT_AUTOSAVE_IDLE_MS: u64 = 4_000;
+/// Sane range for the autosave idle debounce: 250 ms..=300 s (TR-025). Clamped
+/// up from 0/below-min so autosave is never disabled by a tiny/zero value.
+const MIN_AUTOSAVE_IDLE_MS: u64 = 250;
+const MAX_AUTOSAVE_IDLE_MS: u64 = 300_000;
+
+/// Default autosave edit-count trigger: 50 edits (TR-025). Whichever of idle or
+/// edit-count fires first triggers the sidecar write.
+const DEFAULT_AUTOSAVE_EDIT_COUNT: u32 = 50;
+/// Sane range for the autosave edit-count trigger: `1..=10_000` (TR-025). Never
+/// 0 (0 would never fire on edit count) and never unbounded.
+const MIN_AUTOSAVE_EDIT_COUNT: u32 = 1;
+const MAX_AUTOSAVE_EDIT_COUNT: u32 = 10_000;
+
+/// Default undo coalesce window: 500 ms (TR-027). Edits closer together than
+/// this fold into a single undo unit.
+const DEFAULT_COALESCE_WINDOW_MS: u64 = 500;
+/// Sane range for the coalesce window: 50 ms..=5 s (TR-027). Clamped up from
+/// 0/below-min so coalescing is never disabled.
+const MIN_COALESCE_WINDOW_MS: u64 = 50;
+const MAX_COALESCE_WINDOW_MS: u64 = 5_000;
+
 /// How the formatter treats runs of blank lines between elements (FR-007).
 ///
 /// Mirrors `ron_core::BlankLinePolicy`; kept as its own type so `ronin-app` does
@@ -147,6 +193,162 @@ impl FormattingConfig {
     }
 }
 
+/// Bounded undo/redo history configuration persisted with the app settings
+/// (E007 TR-024/TR-027).
+///
+/// Mirrors the `FormattingConfig` robustness pattern: an absent or corrupt
+/// on-disk value falls back to the defaults and an out-of-range value is clamped
+/// (on load via [`AppSettings::load_from`] and via the effective accessors), so a
+/// hand-edited settings file can NEVER disable the undo bound or coalescing — it
+/// can only land inside the sane range. Defaults mirror `ron_core::undo`'s
+/// constants (200 units / 64 MiB / 500 ms) so the editor's stack and the
+/// persisted config never diverge (TR-024/TR-026/TR-027).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UndoConfig {
+    /// Maximum number of undo units retained (default 200, clamped to
+    /// `1..=10_000`). Never 0 — undo is never disabled (TR-024).
+    pub history_count_cap: usize,
+    /// Maximum total retained snapshot byte-size (default 64 MiB, clamped to
+    /// 1 MiB..=1 GiB) — bounds memory on large files (TR-024).
+    pub history_byte_cap: usize,
+    /// Coalesce window in milliseconds: edits closer than this fold into one undo
+    /// unit (default 500 ms, clamped to 50 ms..=5 s) (TR-027).
+    pub coalesce_window_ms: u64,
+}
+
+impl Default for UndoConfig {
+    fn default() -> Self {
+        Self {
+            history_count_cap: DEFAULT_UNDO_COUNT_CAP,
+            history_byte_cap: DEFAULT_UNDO_BYTE_CAP,
+            coalesce_window_ms: DEFAULT_COALESCE_WINDOW_MS,
+        }
+    }
+}
+
+impl UndoConfig {
+    /// The undo unit-count cap clamped to `1..=10_000` (TR-024). Read the cap
+    /// through this rather than the raw field so a corrupt value can never
+    /// disable or unbound the history.
+    #[must_use]
+    pub fn effective_history_count_cap(&self) -> usize {
+        self.history_count_cap
+            .clamp(MIN_UNDO_COUNT_CAP, MAX_UNDO_COUNT_CAP)
+    }
+
+    /// The undo byte-size cap clamped to 1 MiB..=1 GiB (TR-024).
+    #[must_use]
+    pub fn effective_history_byte_cap(&self) -> usize {
+        self.history_byte_cap
+            .clamp(MIN_UNDO_BYTE_CAP, MAX_UNDO_BYTE_CAP)
+    }
+
+    /// The coalesce window clamped to 50 ms..=5 s (TR-027).
+    #[must_use]
+    pub fn effective_coalesce_window_ms(&self) -> u64 {
+        self.coalesce_window_ms
+            .clamp(MIN_COALESCE_WINDOW_MS, MAX_COALESCE_WINDOW_MS)
+    }
+
+    /// The coalesce window as a [`Duration`](std::time::Duration), clamped to the
+    /// sane range — the value to hand to `ron_core::UndoStack` (TR-027).
+    #[must_use]
+    pub fn effective_coalesce_window(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.effective_coalesce_window_ms())
+    }
+
+    /// Build the `ron_core::UndoCap` this config maps to, taken through the
+    /// effective (clamped) accessors so the editor's stack is always bounded
+    /// (TR-024). `ron_core::UndoCap::new` itself reverts a zero field to default,
+    /// so the bound is doubly guarded.
+    #[must_use]
+    pub fn to_engine_cap(&self) -> ron_core::UndoCap {
+        ron_core::UndoCap::new(
+            self.effective_history_count_cap(),
+            self.effective_history_byte_cap(),
+        )
+    }
+
+    /// Set the undo unit-count cap, clamping to `1..=10_000` (TR-024).
+    pub fn set_history_count_cap(&mut self, count: usize) {
+        self.history_count_cap = count.clamp(MIN_UNDO_COUNT_CAP, MAX_UNDO_COUNT_CAP);
+    }
+
+    /// Set the undo byte-size cap, clamping to 1 MiB..=1 GiB (TR-024).
+    pub fn set_history_byte_cap(&mut self, bytes: usize) {
+        self.history_byte_cap = bytes.clamp(MIN_UNDO_BYTE_CAP, MAX_UNDO_BYTE_CAP);
+    }
+
+    /// Set the coalesce window (ms), clamping to 50 ms..=5 s (TR-027).
+    pub fn set_coalesce_window_ms(&mut self, ms: u64) {
+        self.coalesce_window_ms = ms.clamp(MIN_COALESCE_WINDOW_MS, MAX_COALESCE_WINDOW_MS);
+    }
+}
+
+/// Autosave (crash-recovery sidecar) debounce configuration persisted with the
+/// app settings (E007 TR-025).
+///
+/// Same robustness contract as [`UndoConfig`]: corrupt / out-of-range values
+/// clamp to the sane range on load and via the effective accessors, so autosave
+/// can NEVER be disabled by a tiny / zero / hand-edited value (TR-026). Autosave
+/// fires on whichever trigger binds first — idle debounce OR edit count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutosaveConfig {
+    /// Idle debounce in milliseconds before a dirty+changed buffer is autosaved
+    /// to its recovery sidecar (default 4000 ms, clamped to 250 ms..=300 s)
+    /// (TR-025).
+    pub idle_debounce_ms: u64,
+    /// Edit-count trigger: autosave after this many edits since the last sidecar
+    /// write, whichever fires first with the idle debounce (default 50, clamped
+    /// to `1..=10_000`) (TR-025).
+    pub edit_count_trigger: u32,
+}
+
+impl Default for AutosaveConfig {
+    fn default() -> Self {
+        Self {
+            idle_debounce_ms: DEFAULT_AUTOSAVE_IDLE_MS,
+            edit_count_trigger: DEFAULT_AUTOSAVE_EDIT_COUNT,
+        }
+    }
+}
+
+impl AutosaveConfig {
+    /// The idle debounce clamped to 250 ms..=300 s (TR-025). Read through this so
+    /// a corrupt / zero value can never disable autosave.
+    #[must_use]
+    pub fn effective_idle_debounce_ms(&self) -> u64 {
+        self.idle_debounce_ms
+            .clamp(MIN_AUTOSAVE_IDLE_MS, MAX_AUTOSAVE_IDLE_MS)
+    }
+
+    /// The idle debounce as a [`Duration`](std::time::Duration), clamped to the
+    /// sane range — the value the autosave timer compares elapsed idle against.
+    #[must_use]
+    pub fn effective_idle_debounce(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.effective_idle_debounce_ms())
+    }
+
+    /// The edit-count trigger clamped to `1..=10_000` (TR-025).
+    #[must_use]
+    pub fn effective_edit_count_trigger(&self) -> u32 {
+        self.edit_count_trigger
+            .clamp(MIN_AUTOSAVE_EDIT_COUNT, MAX_AUTOSAVE_EDIT_COUNT)
+    }
+
+    /// Set the idle debounce (ms), clamping to 250 ms..=300 s (TR-025).
+    pub fn set_idle_debounce_ms(&mut self, ms: u64) {
+        self.idle_debounce_ms = ms.clamp(MIN_AUTOSAVE_IDLE_MS, MAX_AUTOSAVE_IDLE_MS);
+    }
+
+    /// Set the edit-count trigger, clamping to `1..=10_000` (TR-025).
+    pub fn set_edit_count_trigger(&mut self, count: u32) {
+        self.edit_count_trigger = count.clamp(MIN_AUTOSAVE_EDIT_COUNT, MAX_AUTOSAVE_EDIT_COUNT);
+    }
+}
+
 /// User-facing application settings persisted between sessions (FR-016).
 ///
 /// Deliberately excludes any session/document state. Unknown fields in an older
@@ -164,6 +366,14 @@ pub struct AppSettings {
     /// Formatter configuration (FR-007): indent width, blank-line policy, and the
     /// format-on-save toggle. Defaults on absent / corrupt (serde `default`).
     pub formatting: FormattingConfig,
+    /// Bounded undo/redo history configuration (E007 TR-024/TR-027): history
+    /// count + byte caps and the coalesce window. Defaults on absent / corrupt;
+    /// clamped on load so the bound and coalescing are never disabled (TR-026).
+    pub undo: UndoConfig,
+    /// Autosave (recovery sidecar) debounce configuration (E007 TR-025): idle
+    /// debounce and edit-count trigger. Defaults on absent / corrupt; clamped on
+    /// load so autosave is never disabled (TR-026).
+    pub autosave: AutosaveConfig,
 }
 
 impl Default for AppSettings {
@@ -173,6 +383,8 @@ impl Default for AppSettings {
             preferences: BTreeMap::new(),
             large_file_threshold: DEFAULT_LARGE_FILE_THRESHOLD,
             formatting: FormattingConfig::default(),
+            undo: UndoConfig::default(),
+            autosave: AutosaveConfig::default(),
         }
     }
 }
@@ -209,6 +421,15 @@ impl AppSettings {
         // Enforce the FR-007 indent clamp on load so a hand-edited / corrupt indent
         // width can never push the effective formatter config out of range.
         settings.formatting.indent_width = settings.formatting.effective_indent_width();
+        // Enforce the E007 NEW-CONFIG clamps on load (TR-026): a corrupt /
+        // out-of-range / zero undo or autosave value is pulled back into its sane
+        // range so the bound, the debounce, and coalescing are NEVER disabled —
+        // it can only land at a valid in-range value, never "off"/unbounded.
+        settings.undo.history_count_cap = settings.undo.effective_history_count_cap();
+        settings.undo.history_byte_cap = settings.undo.effective_history_byte_cap();
+        settings.undo.coalesce_window_ms = settings.undo.effective_coalesce_window_ms();
+        settings.autosave.idle_debounce_ms = settings.autosave.effective_idle_debounce_ms();
+        settings.autosave.edit_count_trigger = settings.autosave.effective_edit_count_trigger();
         settings
     }
 
@@ -516,6 +737,157 @@ mod tests {
             engine.blank_line_policy(),
             ron_core::BlankLinePolicy::Preserve
         );
+    }
+
+    // --- E007 NEW-CONFIG: undo + autosave (TR-024/025/026/027) -------------
+
+    #[test]
+    fn undo_config_defaults() {
+        let u = UndoConfig::default();
+        assert_eq!(u.history_count_cap, 200);
+        assert_eq!(u.history_byte_cap, 64 * 1024 * 1024);
+        assert_eq!(u.coalesce_window_ms, 500);
+        // The default app settings embed the default undo config.
+        assert_eq!(AppSettings::default().undo, UndoConfig::default());
+        // Defaults mirror the ron_core::undo constants (never diverge).
+        assert_eq!(u.history_count_cap, ron_core::undo::DEFAULT_UNDO_COUNT_CAP);
+        assert_eq!(u.history_byte_cap, ron_core::undo::DEFAULT_UNDO_BYTE_CAP);
+        assert_eq!(
+            u.effective_coalesce_window(),
+            ron_core::undo::DEFAULT_COALESCE_WINDOW
+        );
+    }
+
+    #[test]
+    fn autosave_config_defaults() {
+        let a = AutosaveConfig::default();
+        assert_eq!(a.idle_debounce_ms, 4_000);
+        assert_eq!(a.edit_count_trigger, 50);
+        assert_eq!(AppSettings::default().autosave, AutosaveConfig::default());
+    }
+
+    #[test]
+    fn undo_config_clamps_tiny_and_huge_to_range() {
+        let mut u = UndoConfig::default();
+        // Zero/below-min never disables the bound — clamps up to the minimum.
+        u.set_history_count_cap(0);
+        assert_eq!(u.history_count_cap, MIN_UNDO_COUNT_CAP);
+        u.set_history_byte_cap(0);
+        assert_eq!(u.history_byte_cap, MIN_UNDO_BYTE_CAP);
+        u.set_coalesce_window_ms(0);
+        assert_eq!(u.coalesce_window_ms, MIN_COALESCE_WINDOW_MS);
+        // Absurdly large clamps down to the maximum.
+        u.set_history_count_cap(usize::MAX);
+        assert_eq!(u.history_count_cap, MAX_UNDO_COUNT_CAP);
+        u.set_history_byte_cap(usize::MAX);
+        assert_eq!(u.history_byte_cap, MAX_UNDO_BYTE_CAP);
+        u.set_coalesce_window_ms(u64::MAX);
+        assert_eq!(u.coalesce_window_ms, MAX_COALESCE_WINDOW_MS);
+        // A normal value is preserved.
+        u.set_history_count_cap(500);
+        assert_eq!(u.history_count_cap, 500);
+        assert_eq!(u.effective_history_count_cap(), 500);
+    }
+
+    #[test]
+    fn autosave_config_clamps_tiny_and_huge_to_range() {
+        let mut a = AutosaveConfig::default();
+        a.set_idle_debounce_ms(0);
+        assert_eq!(a.idle_debounce_ms, MIN_AUTOSAVE_IDLE_MS);
+        a.set_edit_count_trigger(0);
+        assert_eq!(a.edit_count_trigger, MIN_AUTOSAVE_EDIT_COUNT);
+        a.set_idle_debounce_ms(u64::MAX);
+        assert_eq!(a.idle_debounce_ms, MAX_AUTOSAVE_IDLE_MS);
+        a.set_edit_count_trigger(u32::MAX);
+        assert_eq!(a.edit_count_trigger, MAX_AUTOSAVE_EDIT_COUNT);
+        a.set_idle_debounce_ms(10_000);
+        assert_eq!(a.idle_debounce_ms, 10_000);
+        assert_eq!(a.effective_idle_debounce_ms(), 10_000);
+    }
+
+    #[test]
+    fn undo_config_maps_to_engine_cap() {
+        let mut u = UndoConfig::default();
+        u.set_history_count_cap(42);
+        u.set_history_byte_cap(2 * 1024 * 1024);
+        let cap = u.to_engine_cap();
+        assert_eq!(cap.max_count, 42);
+        assert_eq!(cap.max_bytes, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn load_from_clamps_out_of_range_undo_and_autosave() {
+        let dir = std::env::temp_dir().join("ronin_settings_e007_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clamp.json");
+        // A hand-edited file demanding disabled/out-of-range persistence knobs:
+        // 0 undo cap, 0 byte cap, 0 coalesce window, 0 autosave idle, 0 edits.
+        std::fs::write(
+            &path,
+            br#"{"undo":{"history_count_cap":0,"history_byte_cap":0,"coalesce_window_ms":0},
+                "autosave":{"idle_debounce_ms":0,"edit_count_trigger":0}}"#,
+        )
+        .unwrap();
+        let loaded = AppSettings::load_from(&path);
+        // Never disabled: every knob is pulled up to its minimum, not left at 0.
+        assert_eq!(loaded.undo.history_count_cap, MIN_UNDO_COUNT_CAP);
+        assert_eq!(loaded.undo.history_byte_cap, MIN_UNDO_BYTE_CAP);
+        assert_eq!(loaded.undo.coalesce_window_ms, MIN_COALESCE_WINDOW_MS);
+        assert_eq!(loaded.autosave.idle_debounce_ms, MIN_AUTOSAVE_IDLE_MS);
+        assert_eq!(loaded.autosave.edit_count_trigger, MIN_AUTOSAVE_EDIT_COUNT);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_from_clamps_huge_undo_and_autosave() {
+        let dir = std::env::temp_dir().join("ronin_settings_e007_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("huge.json");
+        std::fs::write(
+            &path,
+            br#"{"undo":{"history_count_cap":1000000,"history_byte_cap":9999999999999,"coalesce_window_ms":999999},
+                "autosave":{"idle_debounce_ms":999999999,"edit_count_trigger":999999}}"#,
+        )
+        .unwrap();
+        let loaded = AppSettings::load_from(&path);
+        assert_eq!(loaded.undo.history_count_cap, MAX_UNDO_COUNT_CAP);
+        assert_eq!(loaded.undo.history_byte_cap, MAX_UNDO_BYTE_CAP);
+        assert_eq!(loaded.undo.coalesce_window_ms, MAX_COALESCE_WINDOW_MS);
+        assert_eq!(loaded.autosave.idle_debounce_ms, MAX_AUTOSAVE_IDLE_MS);
+        assert_eq!(loaded.autosave.edit_count_trigger, MAX_AUTOSAVE_EDIT_COUNT);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_from_uses_undo_autosave_defaults_when_absent() {
+        // An older settings file with no `undo`/`autosave` block loads with the
+        // defaults (serde `default`), never a parse error (TR-026).
+        let dir = std::env::temp_dir().join("ronin_settings_e007_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("absent.json");
+        std::fs::write(&path, br#"{"large_file_threshold": 1048576}"#).unwrap();
+        let loaded = AppSettings::load_from(&path);
+        assert_eq!(loaded.undo, UndoConfig::default());
+        assert_eq!(loaded.autosave, AutosaveConfig::default());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn undo_autosave_round_trip_through_save_and_load() {
+        let dir = std::env::temp_dir().join("ronin_settings_e007_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("roundtrip.json");
+        let mut s = AppSettings::default();
+        s.undo.set_history_count_cap(123);
+        s.undo.set_history_byte_cap(8 * 1024 * 1024);
+        s.undo.set_coalesce_window_ms(750);
+        s.autosave.set_idle_debounce_ms(6_000);
+        s.autosave.set_edit_count_trigger(25);
+        s.save_to(&path).unwrap();
+        let loaded = AppSettings::load_from(&path);
+        assert_eq!(loaded.undo, s.undo);
+        assert_eq!(loaded.autosave, s.autosave);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

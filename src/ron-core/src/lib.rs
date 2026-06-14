@@ -49,6 +49,12 @@
 //! * **Print** — [`print`] / [`print_node`] (byte-for-byte round-trip).
 //! * **Edit** — [`apply_edit`] with [`EditOperation`] / [`EditTarget`] /
 //!   [`EditKind`] / [`TriviaPolicy`] (non-destructive; INV-8).
+//! * **Undo/redo** — [`UndoStack`] / [`UndoEntry`] (E007): a bounded,
+//!   WASM-clean CST + text + cursor history with exact-prior-byte restore;
+//!   reusable across surfaces and adds no filesystem/native dependency (TR-014).
+//!   This is the public undo surface the downstream editing epics import — E005
+//!   (smart authoring) and E008 (structural / table editing) edit against it via
+//!   this re-export (TR-013); see the [`undo`] module docs for the reuse contract.
 //!
 //! # Status
 //!
@@ -90,6 +96,7 @@ pub mod lexer;
 pub mod parser;
 pub mod printer;
 pub mod syntax;
+pub mod undo;
 
 pub use completion::{
     completion_context, completions, CompletionContext, CompletionItem, CompletionKind,
@@ -104,6 +111,7 @@ pub use parser::{
 };
 pub use printer::{print, print_node};
 pub use syntax::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, TextRange};
+pub use undo::{UndoCap, UndoEntry, UndoStack};
 
 /// Typed accessors over the CST (TR-010): navigate RON constructs by name
 /// (`Struct::fields()`, `Map::entries()`, …) through `ron-core` types only.

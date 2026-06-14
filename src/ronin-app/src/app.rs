@@ -188,6 +188,31 @@ pub struct DirtyPrompt {
     pub action: PendingAction,
 }
 
+/// The user's choice on a crash-recovery restore offer (E007 OBJ2 — TR-008).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryChoice {
+    /// Restore the in-progress (autosaved) buffer from the recovery sidecar.
+    Restore,
+    /// Decline: open the on-disk file instead (the recovered content is not
+    /// silently discarded — the user chose the on-disk version).
+    Decline,
+}
+
+/// A live crash-recovery restore offer awaiting the user's decision (E007 OBJ2 —
+/// TR-008, SC-003).
+///
+/// Raised on reopen when a **live, content-divergent** recovery sidecar is detected
+/// for a file being opened (modelled on [`DirtyPrompt`]). Accepting restores the
+/// in-progress buffer; declining opens the on-disk file. A stale / same-content
+/// sidecar never produces an offer (TR-009).
+#[derive(Debug, Clone)]
+pub struct RecoveryOffer {
+    /// The user file path that was being opened.
+    pub path: PathBuf,
+    /// The detected recovery sidecar holding the in-progress work.
+    pub sidecar: crate::recovery::RecoverySidecar,
+}
+
 /// The RONin desktop editor shell (FR-003).
 pub struct App {
     /// The multi-tab workspace: open documents, the active-tab pointer, the
@@ -257,6 +282,19 @@ pub struct App {
     /// The index of the rule currently being edited in-place, or `None` when the
     /// rule form is adding a new rule (E006 US2 — FR-008).
     editing_rule: Option<usize>,
+    /// The off-frame autosave worker that performs recovery-sidecar writes off the
+    /// per-frame path (E007 OBJ2 — TR-016/TR-023, SC-008).
+    ///
+    /// The frame loop runs only the cheap [`EditorDocument::should_autosave`] check
+    /// (`maybe_autosave`); when it fires, a [`RecoverySidecar`](crate::recovery::RecoverySidecar)
+    /// snapshot is handed to this worker, which does the atomic, crash-safe write
+    /// (the `fsync` cost) on its own thread — never on the render thread.
+    autosave_worker: crate::recovery::AutosaveWorker,
+    /// A live crash-recovery restore offer, when one is open (E007 OBJ2 — TR-008).
+    ///
+    /// Raised on reopen when a live, divergent recovery sidecar is detected; the
+    /// user accepts (restore in-progress work) or declines (open on-disk file).
+    recovery_offer: Option<RecoveryOffer>,
 }
 
 impl App {
@@ -298,6 +336,8 @@ impl App {
             override_draft: crate::settings::BindingFormDraft::default(),
             rule_draft: crate::settings::BindingFormDraft::default(),
             editing_rule: None,
+            autosave_worker: crate::recovery::AutosaveWorker::new(),
+            recovery_offer: None,
         };
         // Surface any snippet-file degrade notice once at startup (FR-017/FR-034).
         app.surface_snippet_notice();
@@ -1096,6 +1136,21 @@ impl App {
             self.apply_binding_to_active();
             return;
         }
+        // E007 OBJ2 (TR-008/SC-003): on reopen, detect a live, content-divergent
+        // recovery sidecar for this file. If one exists, raise a restore offer and
+        // defer the open — the user decides restore (in-progress work) vs. decline
+        // (on-disk file). A stale / same-content sidecar produces no offer.
+        if let Ok(on_disk) = std::fs::read(path) {
+            if let crate::recovery::RecoveryDetection::Offer(sidecar) =
+                crate::recovery::detect_recovery(path, &on_disk)
+            {
+                self.recovery_offer = Some(RecoveryOffer {
+                    path: path.to_path_buf(),
+                    sidecar,
+                });
+                return;
+            }
+        }
         match open_path(path) {
             Ok(mut doc) => {
                 // Bump the edit generation once and request an initial parse so the
@@ -1140,6 +1195,79 @@ impl App {
             OpenError::Io(io) => format!("Cannot open {name}: {io}"),
         };
         self.notices.push(Notice::error(message));
+    }
+
+    /// The live crash-recovery restore offer, if one is open (for tests/hosts)
+    /// (E007 OBJ2 — TR-008).
+    #[must_use]
+    pub fn recovery_offer(&self) -> Option<&RecoveryOffer> {
+        self.recovery_offer.as_ref()
+    }
+
+    /// Resolve an open crash-recovery restore offer with the user's `choice` (E007
+    /// OBJ2 — TR-008, SC-003).
+    ///
+    /// * [`RecoveryChoice::Restore`] → open the on-disk file as the document
+    ///   identity (path + load-time fidelity) but replace its buffer with the
+    ///   recovered in-progress content, leaving it **dirty** so the recovered work is
+    ///   not silently treated as saved. The recovered buffer's byte fidelity is
+    ///   preserved via the sidecar's `fidelity_hint` (TR-021).
+    /// * [`RecoveryChoice::Decline`] → open the on-disk file normally; the recovered
+    ///   content is dropped (the user chose the on-disk version — never silently
+    ///   loaded, never silently discarded).
+    ///
+    /// Either way the offer is cleared. A no-op when no offer is open.
+    pub fn resolve_recovery_offer(&mut self, choice: RecoveryChoice) {
+        let Some(offer) = self.recovery_offer.take() else {
+            return;
+        };
+        match choice {
+            RecoveryChoice::Restore => self.restore_from_sidecar(&offer),
+            RecoveryChoice::Decline => self.open_on_disk_no_recovery(&offer.path),
+        }
+    }
+
+    /// Open `path`'s on-disk file but replace its buffer with the recovered
+    /// in-progress content from `offer.sidecar`, leaving it dirty (E007 OBJ2 —
+    /// TR-008/TR-021).
+    fn restore_from_sidecar(&mut self, offer: &RecoveryOffer) {
+        // Open the on-disk file to establish the document identity + load-time
+        // fidelity baseline, then splice in the recovered buffer.
+        match open_path(&offer.path) {
+            Ok(mut doc) => {
+                // Replace the buffer with the recovered in-progress content and keep
+                // the recovered byte-fidelity profile so a subsequent save re-emits
+                // it byte-for-byte (TR-021). The saved baseline stays the on-disk
+                // one, so the restored doc is correctly **dirty**.
+                doc.buffer = offer.sidecar.buffer.clone();
+                doc.byte_profile = offer.sidecar.restored_profile();
+                doc.on_edit();
+                doc.request_reparse(&self.worker);
+                self.workspace.open(doc);
+                self.maybe_adopt_project_root(&offer.path);
+                self.apply_binding_to_active();
+            }
+            Err(e) => {
+                // The on-disk file vanished/became unreadable since the offer; surface
+                // it. (The sidecar is left in place so a later reopen can still offer.)
+                self.push_open_error(&e, &offer.path);
+            }
+        }
+    }
+
+    /// Open `path`'s on-disk file directly, bypassing recovery-sidecar detection
+    /// (the Decline path) (E007 OBJ2 — TR-008).
+    fn open_on_disk_no_recovery(&mut self, path: &std::path::Path) {
+        match open_path(path) {
+            Ok(mut doc) => {
+                doc.on_edit();
+                doc.request_reparse(&self.worker);
+                self.workspace.open(doc);
+                self.maybe_adopt_project_root(path);
+                self.apply_binding_to_active();
+            }
+            Err(e) => self.push_open_error(&e, path),
+        }
     }
 
     /// Create a fresh, empty untitled document and make it the active tab.
@@ -1267,6 +1395,15 @@ impl App {
                 doc.byte_profile = ByteFidelityProfile::from_bytes(&written);
                 doc.untitled_seq = None;
                 doc.mark_saved();
+                // E007 OBJ2 (TR-009): a clean save removes the recovery sidecar so a
+                // stale/orphan sidecar is never offered on the next open. Reset the
+                // debounce bookkeeping to the now-saved generation so a fresh edit is
+                // required before the next autosave. Best-effort: a removal error is
+                // logged, never fatal.
+                doc.mark_autosaved();
+                if let Err(e) = crate::recovery::remove_sidecar(path) {
+                    tracing::warn!(error = %e, "failed to remove recovery sidecar after save");
+                }
                 true
             }
             Err(e) => {
@@ -1276,13 +1413,27 @@ impl App {
         }
     }
 
-    /// Push an **error** notice for a failed save (FR-011). The doc stays dirty.
+    /// Push an **error** notice for a failed atomic save (FR-011 / E007 TR-003).
+    ///
+    /// A failed save NEVER clears dirty or re-baselines `last_saved` — the original
+    /// file is byte-identical (the atomic pipeline only ever swaps the target on a
+    /// committed replace), so the caller leaves the buffer dirty and the user can
+    /// retry. The notice names the failure surface (disk-full, permission, etc.) so
+    /// "never corrupt user data" never degrades into a silent success.
     fn push_save_error(&mut self, err: &SaveError, path: &Path) {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-        let message = match err {
-            SaveError::Io(io) => format!("Cannot save {name}: {io}"),
+        let detail = match err {
+            SaveError::DiskFull(io) => format!("disk full ({io})"),
+            SaveError::PermissionDenied(io) => format!("permission denied ({io})"),
+            SaveError::PartialWrite(io) => format!("write interrupted ({io})"),
+            SaveError::ReplaceFailed(io) => format!("atomic replace failed ({io})"),
+            SaveError::SameFilesystemImpossible(io) => {
+                format!("atomic save not possible at this location ({io})")
+            }
+            SaveError::Io(io) => format!("{io}"),
         };
-        self.notices.push(Notice::error(message));
+        self.notices
+            .push(Notice::error(format!("Cannot save {name}: {detail}")));
     }
 
     /// Hook invoked when a document is dropped after a Discard (FR-010 / FR-012).
@@ -1756,6 +1907,264 @@ impl App {
         }
     }
 
+    /// The cheap per-frame autosave debounce check (E007 OBJ2 — AD-004/TR-006/
+    /// TR-016/TR-023).
+    ///
+    /// This is the **only** autosave work the per-frame `update` path performs, and
+    /// it does **no** I/O: for each open document it (1) syncs the debounce with the
+    /// live (clamped) [`AutosaveConfig`](crate::settings::AutosaveConfig), (2) notes a
+    /// buffer change when the document is dirty (keyed on `edit_generation`, idempotent
+    /// per generation), and (3) runs the cheap [`EditorDocument::should_autosave`]
+    /// check against `now`. When it fires, it hands a
+    /// [`RecoverySidecar`](crate::recovery::RecoverySidecar) snapshot to the off-frame
+    /// [`AutosaveWorker`](crate::recovery::AutosaveWorker) — the actual atomic,
+    /// crash-safe sidecar write (and its `fsync` cost) runs on the worker thread,
+    /// never here (TR-016/TR-023, SC-008). An **untitled** buffer is never autosaved
+    /// (TR-017); a **clean** buffer never autosaves (the only-when-changed gate), so a
+    /// no-op tick writes nothing (SC-010).
+    ///
+    /// `now` is injectable so the debounce is deterministically testable
+    /// (TR-020); the live frame loop passes [`Instant::now`].
+    fn maybe_autosave(&mut self, now: Instant) {
+        let config = self.settings.autosave;
+        for doc in self.workspace.documents_mut() {
+            doc.set_autosave_config(config);
+            // Note a change only while the document is dirty (an untitled or
+            // already-saved doc has nothing to recover). Idempotent per generation.
+            if doc.dirty() {
+                doc.note_change(now);
+            }
+            if doc.should_autosave(now) {
+                if let Some(sidecar) = doc.recovery_snapshot() {
+                    self.autosave_worker.enqueue(sidecar);
+                    // One write per debounce window: record the dispatch so the next
+                    // tick only fires after a new change (SC-010).
+                    doc.mark_autosaved();
+                }
+            }
+        }
+        // Drain any finished off-frame write outcomes (non-blocking) so the channel
+        // does not grow unbounded; the result is advisory (the buffer's own dirty
+        // state is the source of truth, not the sidecar).
+        while self.autosave_worker.poll().is_some() {}
+    }
+
+    /// Handle the undo/redo keyboard shortcuts (E007 OBJ3 — TR-010, SC-005).
+    ///
+    /// Consumes the standard editor shortcuts and drives the active document's
+    /// CST-backed history:
+    ///
+    /// * **Undo** — `Ctrl+Z` (Windows/Linux) / `Cmd+Z` (macOS).
+    /// * **Redo** — `Ctrl+Y` / `Cmd+Y`, or `Ctrl+Shift+Z` / `Cmd+Shift+Z`.
+    ///
+    /// The shortcuts are consumed via [`egui::InputState::consume_shortcut`] so they
+    /// take precedence over egui's built-in `TextEdit` undo and drive RONin's own
+    /// byte-faithful, bounded history instead. A repaint is requested when a step is
+    /// taken so the restored buffer + a fresh reparse paint immediately. A no-op
+    /// when no tab is open or there is nothing to (re)do.
+    fn handle_undo_shortcuts(&mut self, ctx: &egui::Context) {
+        use egui::{Key, KeyboardShortcut, Modifiers};
+        // `Modifiers::COMMAND` is Cmd on macOS and Ctrl elsewhere — the portable
+        // primary-modifier, matching the platform-native undo chord.
+        let undo = KeyboardShortcut::new(Modifiers::COMMAND, Key::Z);
+        let redo_y = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
+        let redo_shift_z = KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z);
+
+        let (do_undo, do_redo) = ctx.input_mut(|i| {
+            // Check redo (the more specific Shift+Z) first so Ctrl+Shift+Z is not
+            // swallowed by the plain Ctrl+Z matcher.
+            let redo = i.consume_shortcut(&redo_shift_z) || i.consume_shortcut(&redo_y);
+            let undo = i.consume_shortcut(&undo);
+            (undo, redo)
+        });
+
+        if do_redo {
+            self.redo_active();
+        }
+        if do_undo {
+            self.undo_active();
+        }
+    }
+
+    /// The cheap per-frame undo-snapshot bookkeeping (E007 OBJ3 — TR-016/TR-023,
+    /// SC-008).
+    ///
+    /// The undo counterpart to [`maybe_autosave`](Self::maybe_autosave): for each
+    /// open document it (1) syncs the undo stack with the live (clamped)
+    /// [`UndoConfig`](crate::settings::UndoConfig) and (2) records a snapshot **only
+    /// when the buffer advanced** since the last snapshot, coalesced into one undo
+    /// unit per coalesce window (the parse + text-clone cost is paid at most once
+    /// per window, never per keystroke). This keeps undo bookkeeping off the
+    /// per-frame render path and bounded: the per-frame work is a generation
+    /// comparison + an `Instant` subtraction, and the snapshot itself fires at
+    /// coalesce-unit boundaries leveraging the cheap structurally-shared CST clone
+    /// (AD-002/ADR-0001), so the per-frame `update` undo cost stays within the frame
+    /// budget on a large buffer (SC-008).
+    ///
+    /// `now` is injectable so the coalesce timing is deterministically testable
+    /// (TR-020 pattern); the live frame loop passes [`Instant::now`].
+    fn record_undo_snapshots(&mut self, now: Instant) {
+        let config = self.settings.undo;
+        for doc in self.workspace.documents_mut() {
+            doc.set_undo_config(config);
+            doc.record_undo_snapshot(now);
+        }
+    }
+
+    /// Edit the active document's buffer and record an undo snapshot at an explicit
+    /// `now` (E007 OBJ3 deterministic test/host seam — TR-020 pattern, T036).
+    ///
+    /// Mirrors the real per-frame edit + undo-bookkeeping path but takes an injected
+    /// `Instant` so a test can drive coalescing deterministically without depending
+    /// on wall-clock timing: an edit `now` within the configured coalesce window of
+    /// the prior one extends the current undo unit; one after it starts a new unit
+    /// (TR-027, SC-010). Sets the buffer, bumps the edit generation, syncs the live
+    /// undo config, records the coalesced snapshot, and requests an off-frame
+    /// reparse. A no-op when no tab is open.
+    pub fn edit_active_buffer_at(&mut self, buffer: &str, now: Instant) {
+        let config = self.settings.undo;
+        {
+            let Some(doc) = self.workspace.active_document_mut() else {
+                return;
+            };
+            doc.buffer = buffer.to_string();
+            doc.on_edit();
+            doc.set_undo_config(config);
+            doc.record_undo_snapshot(now);
+        }
+        self.reconcile_validation_degrade();
+        if let Some(doc) = self.workspace.active_document_mut() {
+            doc.request_reparse(&self.worker);
+        }
+    }
+
+    /// Undo the active document at an explicit `now` (E007 OBJ3 test/host seam).
+    ///
+    /// Like [`undo_active`](Self::undo_active) but takes an injected `Instant` for
+    /// the pre-undo pending-run flush so the coalesce timing stays deterministic in
+    /// tests. Returns `true` when a step was taken.
+    pub fn undo_active_at(&mut self, now: Instant) -> bool {
+        let Some(doc) = self.workspace.active_document_mut() else {
+            return false;
+        };
+        if doc.undo(now) {
+            doc.request_reparse(&self.worker);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Undo the active document's last change (E007 OBJ3 — TR-010/TR-018, SC-005).
+    ///
+    /// Restores the exact prior **in-memory** bytes + cursor and requests an
+    /// off-frame reparse so highlighting/diagnostics re-run against the restored
+    /// text; dirty-tracking recomputes automatically. In-memory only — never reads
+    /// or writes the file (TR-018). A no-op (returns `false`) when no tab is open or
+    /// there is nothing to undo. `now` drives the pre-undo pending-run flush.
+    pub fn undo_active(&mut self) -> bool {
+        let Some(doc) = self.workspace.active_document_mut() else {
+            return false;
+        };
+        if doc.undo(Instant::now()) {
+            doc.request_reparse(&self.worker);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Redo the active document's last undone change (E007 OBJ3 — TR-010/TR-018,
+    /// SC-005).
+    ///
+    /// Replays the exact bytes + cursor and requests an off-frame reparse. In-memory
+    /// only (TR-018). A no-op (returns `false`) when no tab is open or there is
+    /// nothing to redo.
+    pub fn redo_active(&mut self) -> bool {
+        let Some(doc) = self.workspace.active_document_mut() else {
+            return false;
+        };
+        if doc.redo() {
+            doc.request_reparse(&self.worker);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Force an autosave tick on every open document now, bypassing the idle / edit-
+    /// count thresholds (E007 OBJ2 — TR-020 deterministic seam; for tests/hosts).
+    ///
+    /// Honours the only-when-changed gate and the untitled-no-sidecar rule, so a
+    /// forced tick on a clean / untitled document writes nothing (SC-010). Returns
+    /// the number of sidecar writes dispatched. The write itself still runs off-frame
+    /// on the [`AutosaveWorker`](crate::recovery::AutosaveWorker); call
+    /// [`flush_autosaves`](Self::flush_autosaves) to await completion in a test.
+    pub fn force_autosave_all(&mut self) -> usize {
+        let config = self.settings.autosave;
+        let mut dispatched = 0;
+        for doc in self.workspace.documents_mut() {
+            doc.set_autosave_config(config);
+            if doc.dirty() {
+                doc.note_change(Instant::now());
+            }
+            if doc.force_autosave_tick() {
+                if let Some(sidecar) = doc.recovery_snapshot() {
+                    self.autosave_worker.enqueue(sidecar);
+                    doc.mark_autosaved();
+                    dispatched += 1;
+                }
+            }
+        }
+        dispatched
+    }
+
+    /// Block until `count` off-frame autosave writes have completed (E007 OBJ2 — for
+    /// tests/hosts that need to observe the sidecar on disk after a forced tick).
+    ///
+    /// Drains [`count`] outcomes from the [`AutosaveWorker`](crate::recovery::AutosaveWorker),
+    /// blocking on each, so a test can assert the sidecar file exists after
+    /// [`force_autosave_all`](Self::force_autosave_all). Returns the number of
+    /// outcomes that reported a committed write.
+    pub fn flush_autosaves(&mut self, count: usize) -> usize {
+        let mut committed = 0;
+        for _ in 0..count {
+            // Spin-poll the non-blocking channel until the worker reports the write.
+            loop {
+                if let Some(outcome) = self.autosave_worker.poll() {
+                    if outcome.committed {
+                        committed += 1;
+                    }
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+        committed
+    }
+
+    /// Remove the recovery sidecars for every cleanly-saved (non-dirty) document on
+    /// a clean exit (E007 OBJ2 — TR-009).
+    ///
+    /// Called from [`on_exit`](eframe::App::on_exit) so a stale/orphan sidecar is
+    /// never offered on the next launch. A **dirty** document's sidecar is left in
+    /// place (it IS the recovery insurance for unsaved work after this exit — SC-003);
+    /// only clean, titled documents have their sidecar removed here. Best-effort: a
+    /// removal error is logged, never fatal.
+    fn cleanup_sidecars_on_exit(&self) {
+        for doc in self.workspace.documents() {
+            if doc.dirty() {
+                // Dirty: keep the sidecar — it is the crash-recovery copy.
+                continue;
+            }
+            if let Some(path) = &doc.path {
+                if let Err(e) = crate::recovery::remove_sidecar(path) {
+                    tracing::warn!(error = %e, "failed to remove recovery sidecar on exit");
+                }
+            }
+        }
+    }
+
     /// Render the top menu bar (File: New, Open, Save, Save As, Quit).
     fn render_menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("menu_bar").show_inside(ui, |ui| {
@@ -1826,6 +2235,26 @@ impl App {
                         self.request_quit();
                         ui.close();
                     }
+                });
+                // Edit menu (E007 OBJ3 — TR-010): Undo / Redo of the active
+                // document's CST-backed history. Both show their keyboard chord and
+                // are enabled only when a step is actually available, so the menu
+                // shape stays stable. The commands operate in-memory only (TR-018).
+                ui.menu_button("Edit", |ui| {
+                    let can_undo = self.active_document().is_some_and(EditorDocument::can_undo);
+                    let can_redo = self.active_document().is_some_and(EditorDocument::can_redo);
+                    ui.add_enabled_ui(can_undo, |ui| {
+                        if ui.button("Undo\t\u{2303}Z").clicked() {
+                            self.undo_active();
+                            ui.close();
+                        }
+                    });
+                    ui.add_enabled_ui(can_redo, |ui| {
+                        if ui.button("Redo\t\u{2303}Y").clicked() {
+                            self.redo_active();
+                            ui.close();
+                        }
+                    });
                 });
                 // Format menu (FR-001/FR-002/FR-023): Format Document / Format
                 // Selection. Both invoke the real `ron_core` formatter through the
@@ -2128,6 +2557,49 @@ impl App {
             });
         if let Some(choice) = choice {
             self.resolve_dirty_prompt(choice);
+        }
+    }
+
+    /// Render the crash-recovery restore offer as a modal window when one is open
+    /// (E007 OBJ2 — TR-008, SC-003).
+    ///
+    /// Offers Restore (recover the in-progress autosaved work) vs. Open On-Disk File
+    /// (decline). Modelled on [`render_dirty_prompt`](Self::render_dirty_prompt); the
+    /// recovered content is never silently loaded nor silently discarded — the user
+    /// chooses.
+    fn render_recovery_offer(&mut self, ui: &mut egui::Ui) {
+        let Some(offer) = &self.recovery_offer else {
+            return;
+        };
+        let name = offer
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("this file")
+            .to_string();
+
+        let mut choice: Option<RecoveryChoice> = None;
+        egui::Window::new("Recover unsaved work")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "RONin found autosaved in-progress work for \"{name}\" that differs \
+                     from the file on disk."
+                ));
+                ui.label("Restore the recovered work, or open the file as it is on disk?");
+                ui.horizontal(|ui| {
+                    if ui.button("Restore recovered work").clicked() {
+                        choice = Some(RecoveryChoice::Restore);
+                    }
+                    if ui.button("Open on-disk file").clicked() {
+                        choice = Some(RecoveryChoice::Decline);
+                    }
+                });
+            });
+        if let Some(choice) = choice {
+            self.resolve_recovery_offer(choice);
         }
     }
 
@@ -2512,6 +2984,9 @@ impl App {
         self.render_central(ui);
         // The unsaved-changes prompt floats above everything when open.
         self.render_dirty_prompt(ui);
+        // The crash-recovery restore offer floats above everything when open (E007
+        // OBJ2 — TR-008).
+        self.render_recovery_offer(ui);
         // The Settings window floats above everything when open (FR-007/FR-023).
         self.render_settings_window(ui);
         // The Snippets browser floats above everything when open (FR-025).
@@ -2546,6 +3021,25 @@ impl eframe::App for App {
         // Off-thread parse pump: drain results, request coalesced reparses.
         self.pump_documents();
 
+        // E007 OBJ2 (AD-004/TR-016/TR-023): the cheap per-frame autosave debounce
+        // check. It does NO I/O on this path — when it fires it hands a snapshot to
+        // the off-frame autosave worker, which performs the atomic sidecar write on
+        // its own thread (SC-008). `Instant::now()` is the live clock; tests drive
+        // the deterministic seam (`force_autosave_all`) instead (TR-020).
+        self.maybe_autosave(Instant::now());
+
+        // E007 OBJ3 (TR-016/TR-023, SC-008): the cheap per-frame undo-snapshot
+        // bookkeeping. Like autosave it does the heavy work (parse + snapshot) at
+        // most once per coalesce window, never per keystroke, so the per-frame
+        // `update` undo cost stays within the frame budget on a large buffer.
+        self.record_undo_snapshots(Instant::now());
+
+        // Undo/redo keyboard commands (E007 OBJ3 — TR-010, SC-005). Standard
+        // shortcuts: Ctrl/Cmd+Z undo, Ctrl/Cmd+Y or Ctrl/Cmd+Shift+Z redo. Consumed
+        // before the editor so they drive the document history, not egui's own
+        // TextEdit undo. A no-op when no tab is open / nothing to (re)do.
+        self.handle_undo_shortcuts(&ctx);
+
         self.render_shell(ui);
 
         // A confirmed quit (clean workspace, or resolved prompt) closes the window.
@@ -2572,6 +3066,11 @@ impl eframe::App for App {
     /// reach disk even if the periodic `save` tick had not fired recently.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.persist_settings();
+        // E007 OBJ2 (TR-009): a clean exit removes the recovery sidecars of cleanly-
+        // saved documents so a stale/orphan sidecar is never offered next launch. A
+        // dirty document's sidecar is intentionally kept — it is the crash-recovery
+        // copy of unsaved work this exit leaves behind (SC-003).
+        self.cleanup_sidecars_on_exit();
     }
 }
 

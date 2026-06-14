@@ -38,6 +38,7 @@ pub mod fileio;
 pub mod logging;
 pub mod panels;
 pub mod problems_panel;
+pub mod recovery;
 pub mod reparse;
 pub mod settings;
 pub mod snippets;

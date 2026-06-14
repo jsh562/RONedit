@@ -9,6 +9,13 @@ license.workspace = true
 description = "RONin desktop application shell (stub; full implementation deferred to E003)."
 
 [dependencies]
+# Cross-platform atomic file replace for the never-corrupt save seam (E007,
+# TR-002, AD-001). `atomicwrites` replaces-over-existing atomically — on Windows
+# via `ReplaceFileW`/`MoveFileEx`, on POSIX via `rename(2)` — which plain
+# `std::fs::rename`/`tempfile::persist` CANNOT do over an existing target on
+# Windows. Native-only: confined to `ronin-app`; `ron-core` stays rowan-only and
+# WASM-clean (TR-014, HINT-002). No network/transport dep is introduced.
+atomicwrites = "0.4.4"
 directories = "6.0.0"
 # Use eframe's `glow` (OpenGL) backend, not `wgpu`: the wgpu/DX12 path pulls a
 # `windows-core` version that conflicts in this graph, and a render harness for

@@ -12,15 +12,39 @@
 //!   on-disk identity, a saved snapshot for dirty-tracking, cursor/scroll state,
 //!   and optional derived parse/highlight artifacts produced off the UI thread.
 //!
-//! # Deferred scope (E007)
+//! # E007 — Autosave / crash recovery (OBJ2)
 //!
-//! The document carries no edit history: **undo / redo** (alongside the atomic
-//! save + crash-recovery pipeline) is deferred to **E007**. The dirty-tracking
-//! and saved-snapshot machinery here is the seam an undo stack will build on.
+//! The document carries an autosave/recovery lifecycle hook
+//! ([`EditorDocument::recovery`], an [`AutosaveDebounce`](crate::recovery::AutosaveDebounce))
+//! that the shell drives off the per-frame path: it debounces a recovery-sidecar
+//! write while the buffer is dirty + actually changed, and the shell removes the
+//! sidecar on a clean save / clean exit. An **untitled** buffer (no `path`) has
+//! **no** sidecar (TR-017).
+//!
+//! # E007 — Bounded CST-backed undo/redo (OBJ3)
+//!
+//! The document owns a WASM-clean [`UndoStack`](ron_core::UndoStack) keyed to its
+//! [`CursorState`] ([`EditorDocument::undo`]). The shell records a snapshot at
+//! coalesce-unit boundaries off the per-frame hot path
+//! ([`EditorDocument::record_undo_snapshot`]) — at most once per coalesce window,
+//! not per keystroke (TR-016/TR-023, SC-008) — and [`EditorDocument::undo`] /
+//! [`EditorDocument::redo`] restore the **exact prior in-memory bytes** + cursor
+//! by replacing the buffer with the entry's `source_text` and bumping
+//! `edit_generation` so a reparse runs and dirty-tracking recomputes. Undo/redo
+//! operate **solely** on the in-memory buffer/CST/cursor and never read or write
+//! the file (TR-018). The coalesce *timing* decision is computed here
+//! (`Instant` elapsed since the last edit vs the configured window) and passed to
+//! `ron-core` as a plain `bool`, keeping `ron-core` clock-free (TR-014).
+//!
+//! The dirty-tracking and `edit_generation` machinery here is the seam both OBJ2
+//! and OBJ3 build on.
 
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use ron_core::{UndoEntry, UndoStack};
 
 use crate::binding::{BindingOrigin, BindingState, DocumentOverride, TypeBinding};
 use crate::completion::CompletionState;
@@ -354,6 +378,51 @@ pub struct EditorDocument {
     /// document back down below the threshold automatically resumes validation on the
     /// next reparse. It is purely derived (never persisted, never user-set).
     pub validation_suppressed: bool,
+    /// The autosave / crash-recovery lifecycle hook for this document (E007 OBJ2 —
+    /// TR-006..009/TR-016).
+    ///
+    /// A frame-driven, deterministic [`AutosaveDebounce`](crate::recovery::AutosaveDebounce):
+    /// the shell calls [`note_change`](Self::note_change) when the buffer changes and
+    /// [`should_autosave`](Self::should_autosave) each frame; when it fires, the shell
+    /// hands a [`RecoverySidecar`](crate::recovery::RecoverySidecar) snapshot to the
+    /// off-frame [`AutosaveWorker`](crate::recovery::AutosaveWorker) and then calls
+    /// [`mark_autosaved`](Self::mark_autosaved). An untitled buffer (no `path`) is
+    /// never autosaved (TR-017). Not persisted; rebuilt per session from settings.
+    recovery: crate::recovery::AutosaveDebounce,
+    /// The bounded, WASM-clean CST-backed undo/redo history for this document
+    /// (E007 OBJ3 — TR-010..014/TR-018/TR-024/TR-027).
+    ///
+    /// Keyed to the document's [`CursorState`]; each [`UndoEntry`] snapshots the
+    /// exact buffer bytes + CST + cursor at a coalesce-unit boundary. The shell
+    /// records snapshots off the per-frame path via
+    /// [`record_undo_snapshot`](Self::record_undo_snapshot) and drives
+    /// [`undo`](Self::undo) / [`redo`](Self::redo), which restore the exact prior
+    /// **in-memory** bytes (never the on-disk file, TR-018). Constructed with the
+    /// default config; the shell syncs the live cap + coalesce window each frame
+    /// via [`set_undo_config`](Self::set_undo_config). In-memory / session-scoped:
+    /// never persisted (no revision log; Scope/Excluded).
+    undo: UndoStack<CursorState>,
+    /// The edit generation the last undo snapshot was recorded for (E007 OBJ3).
+    ///
+    /// Coalesces undo bookkeeping off the per-keystroke path: a snapshot is taken
+    /// only when the live [`edit_generation`](Self::edit_generation) has advanced
+    /// past this, so a burst of edits collapses to the latest text — the same
+    /// generation-keyed pattern the reparse/autosave seams use. `None` until the
+    /// initial state is seeded by [`seed_undo`](Self::seed_undo).
+    last_undo_generation: Option<u64>,
+    /// The instant the last undo snapshot was recorded (E007 OBJ3 — TR-027).
+    ///
+    /// The caller-side coalesce timing source (`ron-core` measures no clock,
+    /// TR-014): [`record_undo_snapshot`](Self::record_undo_snapshot) compares the
+    /// elapsed time since this against the configured coalesce window to decide
+    /// whether the new edit extends the current undo unit or starts a new one.
+    /// `None` until the first snapshot is recorded.
+    last_undo_instant: Option<Instant>,
+    /// The coalesce window the undo stack was configured with, as a `Duration`
+    /// (E007 OBJ3 — TR-027). Kept here so the caller-side coalesce decision uses
+    /// the same (clamped) window the stack carries; synced by
+    /// [`set_undo_config`](Self::set_undo_config).
+    undo_coalesce_window: std::time::Duration,
 }
 
 impl EditorDocument {
@@ -375,7 +444,7 @@ impl EditorDocument {
         // buffer but remembered on the profile so save can re-emit it.
         let buffer = text.strip_prefix('\u{FEFF}').unwrap_or(text).to_string();
         let last_saved = SavedSnapshot::of(&buffer);
-        Ok(Self {
+        let mut doc = Self {
             id: mint_doc_id(),
             buffer,
             path: Some(path.into()),
@@ -395,7 +464,18 @@ impl EditorDocument {
             binding: TypeBinding::none(),
             override_: None,
             validation_suppressed: false,
-        })
+            recovery: crate::recovery::AutosaveDebounce::new(
+                crate::settings::AutosaveConfig::default(),
+            ),
+            undo: UndoStack::new(),
+            last_undo_generation: None,
+            last_undo_instant: None,
+            undo_coalesce_window: ron_core::undo::DEFAULT_COALESCE_WINDOW,
+        };
+        // Seed the undo baseline at the loaded (generation-0) state so the first
+        // edit's snapshot pushes the original as the first undo boundary (TR-010).
+        doc.seed_undo();
+        Ok(doc)
     }
 
     /// Create a fresh, empty untitled document with a workspace-assigned
@@ -404,7 +484,7 @@ impl EditorDocument {
     pub fn new_untitled(seq: u32) -> Self {
         let buffer = String::new();
         let last_saved = SavedSnapshot::of(&buffer);
-        Self {
+        let mut doc = Self {
             id: mint_doc_id(),
             buffer,
             path: None,
@@ -432,7 +512,17 @@ impl EditorDocument {
             binding: TypeBinding::none(),
             override_: None,
             validation_suppressed: false,
-        }
+            recovery: crate::recovery::AutosaveDebounce::new(
+                crate::settings::AutosaveConfig::default(),
+            ),
+            undo: UndoStack::new(),
+            last_undo_generation: None,
+            last_undo_instant: None,
+            undo_coalesce_window: ron_core::undo::DEFAULT_COALESCE_WINDOW,
+        };
+        // Seed the undo baseline at the empty (generation-0) state.
+        doc.seed_undo();
+        doc
     }
 
     /// Reconstruct a document from a recently-closed record's fields (FR-012).
@@ -453,7 +543,7 @@ impl EditorDocument {
         cursor: CursorState,
         untitled_seq: Option<u32>,
     ) -> Self {
-        Self {
+        let mut doc = Self {
             id: mint_doc_id(),
             buffer,
             path,
@@ -473,7 +563,18 @@ impl EditorDocument {
             binding: TypeBinding::none(),
             override_: None,
             validation_suppressed: false,
-        }
+            recovery: crate::recovery::AutosaveDebounce::new(
+                crate::settings::AutosaveConfig::default(),
+            ),
+            undo: UndoStack::new(),
+            last_undo_generation: None,
+            last_undo_instant: None,
+            undo_coalesce_window: ron_core::undo::DEFAULT_COALESCE_WINDOW,
+        };
+        // Seed the undo baseline at the restored (generation-0) state so the first
+        // post-reopen edit pushes the restored content as the first undo boundary.
+        doc.seed_undo();
+        doc
     }
 
     /// The process-unique identity token for this document (FR-026).
@@ -494,6 +595,255 @@ impl EditorDocument {
     /// Re-baseline the saved snapshot to the current buffer (call after a save).
     pub fn mark_saved(&mut self) {
         self.last_saved = SavedSnapshot::of(&self.buffer);
+    }
+
+    // --- E007 OBJ2: autosave / crash-recovery lifecycle hooks ----------------
+
+    /// Sync the autosave debounce with the live [`AutosaveConfig`](crate::settings::AutosaveConfig)
+    /// (E007 TR-025/TR-026).
+    ///
+    /// The document is constructed with the default config; the shell calls this so
+    /// the debounce honours the user's persisted (and clamped) idle interval /
+    /// edit-count threshold. Cheap; safe to call every frame.
+    pub fn set_autosave_config(&mut self, config: crate::settings::AutosaveConfig) {
+        self.recovery.set_config(config);
+    }
+
+    /// Record that the buffer changed at `now`, keyed on the current
+    /// [`edit_generation`](Self::edit_generation) (E007 TR-006).
+    ///
+    /// Idempotent per generation, so the shell may call it every frame: only a
+    /// genuinely new generation resets the idle timer and advances the edit-count
+    /// accumulator. This is the *only-when-changed* signal the debounce gates on.
+    pub fn note_change(&mut self, now: std::time::Instant) {
+        self.recovery.note_change(self.edit_generation, now);
+    }
+
+    /// The cheap per-frame check: should this document autosave its sidecar at `now`
+    /// (E007 TR-006/TR-016)?
+    ///
+    /// Returns `true` only when the buffer changed since the last sidecar write AND
+    /// an autosave trigger binds (idle OR edit-count). An **untitled** buffer (no
+    /// `path`) is never autosaved (TR-017), so this is always `false` for it. Performs
+    /// no I/O; the caller hands a snapshot to the off-frame writer when it fires.
+    #[must_use]
+    pub fn should_autosave(&self, now: std::time::Instant) -> bool {
+        self.path.is_some() && self.recovery.poll(now)
+    }
+
+    /// The deterministic test/force hook (E007 TR-020): `true` when there is a
+    /// changed buffer to autosave for a titled document, bypassing the thresholds.
+    ///
+    /// Honours the only-when-changed gate and the untitled-no-sidecar rule, so a
+    /// forced tick on an unchanged or untitled document still writes nothing.
+    #[must_use]
+    pub fn force_autosave_tick(&self) -> bool {
+        self.path.is_some() && self.recovery.force_tick()
+    }
+
+    /// Build the [`RecoverySidecar`](crate::recovery::RecoverySidecar) snapshot for
+    /// this document, or `None` for an untitled buffer (no `path` → no sidecar,
+    /// TR-017).
+    ///
+    /// Captures the live buffer + fidelity profile against the document's `path`. The
+    /// shell hands this to the off-frame [`AutosaveWorker`](crate::recovery::AutosaveWorker).
+    #[must_use]
+    pub fn recovery_snapshot(&self) -> Option<crate::recovery::RecoverySidecar> {
+        let path = self.path.clone()?;
+        Some(crate::recovery::RecoverySidecar::new(
+            path,
+            self.buffer.clone(),
+            &self.byte_profile,
+        ))
+    }
+
+    /// Mark that a sidecar write for the current generation has been dispatched
+    /// (E007 TR-006).
+    ///
+    /// Resets the debounce's edit-count accumulator and records the written
+    /// generation so the next [`should_autosave`](Self::should_autosave) only fires
+    /// after a *new* change — one write per debounce window, never per keystroke
+    /// (SC-010).
+    pub fn mark_autosaved(&mut self) {
+        self.recovery.mark_written();
+    }
+
+    // --- E007 OBJ3: bounded CST-backed undo/redo (TR-010..014/018/024/027) ----
+
+    /// Sync the undo stack with the live [`UndoConfig`](crate::settings::UndoConfig)
+    /// (E007 TR-024/TR-026/TR-027).
+    ///
+    /// The document is constructed with the default undo config; the shell calls
+    /// this so the stack honours the user's persisted (and clamped) history cap and
+    /// coalesce window. Rebuilding the stack would lose history, so this updates the
+    /// cap/window **in place** by reconstructing only when the config actually
+    /// changed and otherwise leaving the existing history intact. Cheap; safe to
+    /// call every frame.
+    pub fn set_undo_config(&mut self, config: crate::settings::UndoConfig) {
+        let cap = config.to_engine_cap();
+        let window = config.effective_coalesce_window();
+        // Only rebuild when the effective config changed, so calling this every
+        // frame does not discard the accumulated history. A change in cap/window
+        // is rare (settings edit), so dropping history then is acceptable and keeps
+        // the bound authoritative.
+        if self.undo.cap() != cap || self.undo_coalesce_window != window {
+            self.undo = UndoStack::with_config(cap, window);
+            self.undo_coalesce_window = window;
+            // Re-seed from the current buffer so undo has a valid baseline after a
+            // config-driven rebuild (no prior boundary; just the current state).
+            self.last_undo_generation = None;
+            self.last_undo_instant = None;
+            self.seed_undo();
+        }
+    }
+
+    /// Seed the undo stack with the document's current state as the baseline
+    /// (E007 OBJ3 — TR-010).
+    ///
+    /// Records the current buffer + CST + cursor as the stack's `current` with no
+    /// prior boundary (the first `record` just seeds). Idempotent per generation:
+    /// only seeds when no snapshot has been recorded yet. Call once after a load /
+    /// reopen / config rebuild so the first edit's snapshot has a baseline to push.
+    pub fn seed_undo(&mut self) {
+        if self.last_undo_generation.is_some() {
+            return;
+        }
+        let entry = self.undo_entry_of_current();
+        self.undo.record(entry, false);
+        self.last_undo_generation = Some(self.edit_generation);
+        // Leave `last_undo_instant` as `None` so the very first real edit starts a
+        // fresh unit (no coalesce against the seed).
+    }
+
+    /// Build an [`UndoEntry`] snapshotting the document's current in-memory state.
+    ///
+    /// Parses the live buffer into a CST and captures the exact buffer bytes +
+    /// cursor. The CST snapshot is structurally shared and cheap to retain
+    /// (AD-002/ADR-0001); the parse cost is paid at most once per coalesce window
+    /// (see [`record_undo_snapshot`](Self::record_undo_snapshot)), never per
+    /// keystroke, so it stays off the per-frame hot path (TR-016/TR-023, SC-008).
+    fn undo_entry_of_current(&self) -> UndoEntry<CursorState> {
+        UndoEntry::new(
+            ron_core::parse(&self.buffer),
+            self.buffer.clone(),
+            self.cursor,
+        )
+    }
+
+    /// Record an undo snapshot for the document's current state at `now`, if the
+    /// buffer advanced since the last snapshot (E007 OBJ3 — TR-010/TR-027, T035..T037).
+    ///
+    /// This is the **only** undo bookkeeping the shell drives, and it is coalesced
+    /// off the per-keystroke path: it does work only when the live
+    /// [`edit_generation`](Self::edit_generation) has advanced past the last
+    /// recorded generation (a burst of edits in one frame snapshots once, the
+    /// latest text). The coalesce *timing* decision is made here, caller-side
+    /// (`ron-core` measures no clock, TR-014): the new edit **extends** the current
+    /// undo unit when it falls within the configured coalesce window of the prior
+    /// snapshot, and **starts a new unit** otherwise (TR-027). A new edit after an
+    /// undo clears the redo stack inside `ron-core` (TR-012).
+    ///
+    /// Returns `true` when a snapshot was recorded (the buffer had advanced).
+    pub fn record_undo_snapshot(&mut self, now: Instant) -> bool {
+        // Seed the baseline lazily so the first edit always has a prior state.
+        if self.last_undo_generation.is_none() {
+            self.seed_undo();
+        }
+        if self.last_undo_generation == Some(self.edit_generation) {
+            return false; // no new edit since the last snapshot
+        }
+        // Caller-side coalesce decision: within the window → extend the unit.
+        let coalesce = self
+            .last_undo_instant
+            .is_some_and(|prev| now.duration_since(prev) < self.undo_coalesce_window);
+        let entry = self.undo_entry_of_current();
+        self.undo.record(entry, coalesce);
+        self.last_undo_generation = Some(self.edit_generation);
+        self.last_undo_instant = Some(now);
+        true
+    }
+
+    /// Whether an undo step is currently available (E007 OBJ3).
+    #[must_use]
+    pub fn can_undo(&self) -> bool {
+        self.undo.can_undo()
+    }
+
+    /// Whether a redo step is currently available (E007 OBJ3).
+    #[must_use]
+    pub fn can_redo(&self) -> bool {
+        self.undo.can_redo()
+    }
+
+    /// Undo the last change, restoring the **exact prior in-memory bytes** + cursor
+    /// (E007 OBJ3 — TR-010/TR-018, SC-005).
+    ///
+    /// Operates **solely** on the in-memory document: it replaces the buffer with
+    /// the prior boundary's `source_text` byte-for-byte (no reflow), restores the
+    /// cursor, and bumps [`edit_generation`](Self::edit_generation) so a reparse
+    /// runs and dirty-tracking recomputes against the restored bytes. It NEVER
+    /// reads or writes the on-disk file — undo of a buffer whose file changed on
+    /// disk still restores the in-memory prior bytes (TR-018). Before stepping it
+    /// flushes any open coalescing run by recording a pending snapshot, so the run
+    /// in progress is itself undoable. Returns `true` when a step was taken.
+    pub fn undo(&mut self, now: Instant) -> bool {
+        // Flush any pending coalesced edits into the stack first so the current
+        // run is a recoverable boundary before we step back.
+        self.record_undo_snapshot(now);
+        let Some(entry) = self.undo.undo() else {
+            return false;
+        };
+        self.apply_restored(&entry);
+        true
+    }
+
+    /// Redo the last undone change, replaying its exact bytes + cursor (E007 OBJ3 —
+    /// TR-010/TR-018, SC-005).
+    ///
+    /// The inverse of [`undo`](Self::undo): replaces the buffer with the replayed
+    /// state's exact bytes, restores the cursor, and bumps the edit generation so a
+    /// reparse runs. In-memory only; never touches the file (TR-018). Returns `true`
+    /// when a step was taken.
+    pub fn redo(&mut self) -> bool {
+        let Some(entry) = self.undo.redo() else {
+            return false;
+        };
+        self.apply_restored(&entry);
+        true
+    }
+
+    /// Apply a restored undo/redo entry to the live in-memory document state.
+    ///
+    /// Replaces the buffer with the entry's exact bytes, restores the cursor, and
+    /// bumps the edit generation so the off-frame reparse re-runs against the
+    /// restored text and dirty-tracking recomputes. The undo bookkeeping
+    /// generation is synced to the post-restore generation so the restore itself is
+    /// not re-snapshotted as a fresh edit (the stack already tracks it as
+    /// `current`). The restore is byte-faithful — no normalization (TR-010).
+    fn apply_restored(&mut self, entry: &UndoEntry<CursorState>) {
+        self.buffer = entry.source_text().to_string();
+        self.cursor = *entry.cursor();
+        self.on_edit();
+        // The restored state is already the stack's `current`; mark it recorded so
+        // the next `record_undo_snapshot` does not push it back as a new edit.
+        self.last_undo_generation = Some(self.edit_generation);
+        // A restore is a discrete action: start a fresh coalesce unit after it by
+        // clearing the timing anchor (the next real edit will not coalesce into it).
+        self.last_undo_instant = None;
+    }
+
+    /// The number of committed undo boundaries currently retained (E007 OBJ3; for
+    /// tests / host integration).
+    #[must_use]
+    pub fn undo_depth(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// The total retained undo+redo snapshot byte-size (E007 OBJ3 — SC-009; for
+    /// tests asserting the bound is independent of file size).
+    #[must_use]
+    pub fn undo_total_bytes(&self) -> usize {
+        self.undo.total_bytes()
     }
 
     /// `true` when the buffer is strictly larger than `threshold` bytes.
