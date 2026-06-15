@@ -47,13 +47,14 @@ use std::time::{Duration, Instant};
 
 use crate::binding::{BindingConfig, BindingRule, DocumentOverride, TypeSourceLocator};
 use crate::document::{ByteFidelityProfile, EditorDocument};
-use crate::editor_view::editor_view;
+use crate::editor_view::{editor_view, structural_form_view};
 use crate::fileio::{open_path, save_bytes, save_document, OpenError, SaveError};
 use crate::panels::{mode_selector_seam_stub, tree_table_seam_stub};
 use crate::problems_panel::problems_panel;
 use crate::reparse::ReparseWorker;
 use crate::settings::{AppSettings, BlankLinePolicy, FormattingConfig, WindowGeometry};
 use crate::snippets::{SnippetSet, UserSnippetFile, USER_SNIPPET_TEMPLATE};
+use crate::structural::view_state::ActiveView;
 use crate::type_acquire::resolve_and_acquire;
 use crate::workspace::{ClosedDocumentRecord, EditorWorkspace};
 use ron_core::{FormatResult, SyntaxKind, SyntaxNode};
@@ -2498,6 +2499,14 @@ impl App {
 
     /// Render the central editor region for the active document, or the
     /// empty-workspace placeholder when no tab is open (FR-022).
+    ///
+    /// Hosts the **per-document view switcher** (E008 — T014/FR-017): a control to
+    /// switch among Text / Tree-form / Table for the active document, defaulting to
+    /// the structural (tree/form) view on open. Switching is **lossless** — it
+    /// changes zero document bytes (FR-020) and keeps any in-progress draft/focus
+    /// (re-resolved by structural-path identity across reparse — FR-016). The actual
+    /// tree/table rendering lands in US1/US2; the structural panes are placeholders
+    /// here while the switcher + view state work end-to-end.
     fn render_central(&mut self, ui: &mut egui::Ui) {
         let threshold = self.settings.effective_large_file_threshold();
         let active = self.workspace.active_index();
@@ -2509,9 +2518,52 @@ impl App {
                 let dot = if doc.dirty() { "\u{25CF} " } else { "" };
                 let title = doc.title();
                 ui.label(format!("{dot}{title}"));
+                // The per-document view switcher (FR-017). Reading/writing the
+                // active view is byte-free (FR-020).
+                Self::render_view_switcher(ui, self.workspace.get_mut(idx));
                 ui.separator();
-                if let Some(doc) = self.workspace.get_mut(idx) {
-                    editor_view(ui, doc, oversize);
+                let view = self
+                    .workspace
+                    .get(idx)
+                    .map(|d| d.view_state().active_view())
+                    .unwrap_or(ActiveView::TreeForm);
+                match view {
+                    ActiveView::Text => {
+                        if let Some(doc) = self.workspace.get_mut(idx) {
+                            editor_view(ui, doc, oversize);
+                        }
+                    }
+                    ActiveView::TreeForm => {
+                        // Host the **auto-routing structural view** (E008 / US3 —
+                        // T039/T040, [COMPLETES FR-010]). This is the document's
+                        // default structural surface (FR-017): it renders the
+                        // always-visible active-binding indicator (FR-011), then
+                        // classifies the document's section and routes it — a
+                        // table-eligible uniform list renders as an embedded
+                        // virtualized table, everything else as tree/form, with a
+                        // persistent per-section boundary indicator + a reversible
+                        // per-section override (FR-010/FR-011/FR-012). The worker is a
+                        // separate field from the workspace, so the split borrow
+                        // (`&mut doc` + `&self.worker`) is sound.
+                        let worker = &self.worker;
+                        if let Some(doc) = self.workspace.get_mut(idx) {
+                            structural_form_view(ui, doc, worker);
+                        }
+                    }
+                    ActiveView::Table => {
+                        // Host the structural table view (E008 / US2 — T035,
+                        // [COMPLETES FR-005]). It renders the always-visible
+                        // active-binding indicator (FR-011) then the virtualized
+                        // grid with inline scalar cell editing, discoverable row
+                        // add/remove, and a nested-cell drill-in — each routed
+                        // through the one-undo-unit edit pipeline. The worker is a
+                        // separate field from the workspace, so the split borrow
+                        // (`&mut doc` + `&self.worker`) is sound.
+                        let worker = &self.worker;
+                        if let Some(doc) = self.workspace.get_mut(idx) {
+                            crate::panels::render_table_seam(ui, doc, worker);
+                        }
+                    }
                 }
             }
             _ => {
@@ -2524,6 +2576,38 @@ impl App {
                 });
             }
         });
+    }
+
+    /// Render the per-document view switcher (E008 — T014/FR-017).
+    ///
+    /// A three-way selector (Text / Tree-form / Table) bound to the document's
+    /// [`ViewSelectionAndFocus::active_view`](crate::structural::view_state::ViewSelectionAndFocus::active_view).
+    /// Switching is lossless: it changes zero document bytes (FR-020) and never
+    /// clears an in-progress draft/focus (FR-017) — the view state keeps the focus,
+    /// which is re-resolved by structural-path identity across reparse (FR-016). A
+    /// no-op when no document is supplied.
+    fn render_view_switcher(ui: &mut egui::Ui, doc: Option<&mut EditorDocument>) {
+        let Some(doc) = doc else {
+            return;
+        };
+        let mut view = doc.view_state().active_view();
+        ui.horizontal(|ui| {
+            ui.label("View:");
+            // Switching only changes the active-view selection; the buffer is never
+            // touched, so every view projects the same lossless CST source (FR-020).
+            ui.selectable_value(&mut view, ActiveView::TreeForm, "Tree/form");
+            ui.selectable_value(&mut view, ActiveView::Table, "Table");
+            ui.selectable_value(&mut view, ActiveView::Text, "Text");
+            if doc.view_state().is_stale() {
+                // FR-015: a user-perceivable stale marker while a reparse is pending.
+                ui.weak("(updating\u{2026})");
+            }
+        });
+        if view != doc.view_state().active_view() {
+            // Keep any in-progress draft/focus across the switch (FR-017) — we only
+            // change the active view; focus is preserved and re-resolved on reparse.
+            doc.view_state_mut().set_active_view(view);
+        }
     }
 
     /// Render the unsaved-changes prompt as a modal window when one is open (FR-010).

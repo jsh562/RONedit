@@ -44,13 +44,16 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use ron_core::{UndoEntry, UndoStack};
+use ron_core::transform::{apply_structural, StructuralOp, TransformOutcome};
+use ron_core::{BlockedReason, UndoEntry, UndoStack};
 
 use crate::binding::{BindingOrigin, BindingState, DocumentOverride, TypeBinding};
 use crate::completion::CompletionState;
 use crate::diagnostics_map::{map_diagnostic, DiagnosticView};
 use crate::editor_view::build_highlight_model;
 use crate::reparse::{BoundType, ParseResult, ReparseWorker};
+use crate::structural::projection::{derive_projection, DerivedProjection};
+use crate::structural::view_state::ViewSelectionAndFocus;
 
 /// Process-wide monotonic source of per-document identity tokens.
 ///
@@ -423,6 +426,32 @@ pub struct EditorDocument {
     /// the same (clamped) window the stack carries; synced by
     /// [`set_undo_config`](Self::set_undo_config).
     undo_coalesce_window: std::time::Duration,
+    /// The per-document structural view selection + edit focus + section overrides
+    /// + stale marker (E008 — FR-015/FR-016/FR-017).
+    ///
+    /// Transient/session-only (never persisted). Default-constructed to the
+    /// structural (tree/form) view on open (FR-017); focus is keyed to a
+    /// [`StructuralPath`](crate::structural::view_state::StructuralPath) identity so
+    /// it survives an off-frame reparse and a virtualization scroll, or drops
+    /// gracefully when its node vanishes (FR-016).
+    view_state: ViewSelectionAndFocus,
+    /// The shared structural projection of the document's top-level value (E008 —
+    /// AD-003/FR-015/FR-026), or `None` until the first reparse lands.
+    ///
+    /// Re-derived **once per landed reparse** off the per-frame path
+    /// ([`poll_parse`](Self::poll_parse)), never per keystroke or per frame; a read
+    /// projection over the CST that changes zero bytes (FR-020). The per-view models
+    /// (tree/table) realize lazily on top of it in US1/US2.
+    projection: Option<DerivedProjection>,
+    /// The last structural-op inline error message, when one is showing (E008 —
+    /// FR-003), or `None`.
+    ///
+    /// Set when a tree/table op returns [`BlockedReason`] (e.g. a rename collision)
+    /// so the structural view can surface it inline using the same field/cell
+    /// indicator model as the diagnostics surfacing (FR-003/FR-018). A blocked op
+    /// changes no bytes and pushes no undo entry, so this is the only state it
+    /// touches. Cleared on the next successful op. Transient/session-only.
+    tree_error: Option<String>,
 }
 
 impl EditorDocument {
@@ -471,6 +500,9 @@ impl EditorDocument {
             last_undo_generation: None,
             last_undo_instant: None,
             undo_coalesce_window: ron_core::undo::DEFAULT_COALESCE_WINDOW,
+            view_state: ViewSelectionAndFocus::new(),
+            projection: None,
+            tree_error: None,
         };
         // Seed the undo baseline at the loaded (generation-0) state so the first
         // edit's snapshot pushes the original as the first undo boundary (TR-010).
@@ -519,6 +551,9 @@ impl EditorDocument {
             last_undo_generation: None,
             last_undo_instant: None,
             undo_coalesce_window: ron_core::undo::DEFAULT_COALESCE_WINDOW,
+            view_state: ViewSelectionAndFocus::new(),
+            projection: None,
+            tree_error: None,
         };
         // Seed the undo baseline at the empty (generation-0) state.
         doc.seed_undo();
@@ -570,6 +605,9 @@ impl EditorDocument {
             last_undo_generation: None,
             last_undo_instant: None,
             undo_coalesce_window: ron_core::undo::DEFAULT_COALESCE_WINDOW,
+            view_state: ViewSelectionAndFocus::new(),
+            projection: None,
+            tree_error: None,
         };
         // Seed the undo baseline at the restored (generation-0) state so the first
         // post-reopen edit pushes the restored content as the first undo boundary.
@@ -885,8 +923,17 @@ impl EditorDocument {
     /// [`request_reparse`](Self::request_reparse) ships the latest text and any
     /// in-flight stale result is later discarded by generation comparison. This is
     /// the *only* per-frame edit hook; it never calls `ron_core::parse` directly.
+    ///
+    /// It also marks the structural projection **stale** (E008 — FR-015): an edit
+    /// has been requested but the off-frame reparse that re-derives the projection
+    /// has not yet landed, so the structural views show a stale marker rather than
+    /// inconsistent state. The marker is cleared when a current reparse lands and
+    /// the projection is re-derived ([`poll_parse`](Self::poll_parse)).
     pub fn on_edit(&mut self) {
         self.edit_generation = self.edit_generation.wrapping_add(1);
+        // E008 FR-015: an edit is requested but the projection's reparse has not
+        // landed — mark stale until `poll_parse` re-derives against the new CST.
+        self.view_state.mark_stale();
     }
 
     /// Queue an off-thread reparse of the current buffer, coalesced (FR-006).
@@ -951,6 +998,18 @@ impl EditorDocument {
             let generation = result.generation;
             self.diagnostics = merge_type_diagnostics(&result, &self.buffer);
             self.highlight = Some(build_highlight_model(&result, generation));
+            // E008 (AD-003/FR-015/FR-026): re-derive the shared structural
+            // projection ONCE per landed current reparse, off the per-frame path.
+            // This is a single read pass over the landed CST (zero bytes, FR-020).
+            self.projection = Some(derive_projection(&result.cst));
+            // E008 (T013/FR-016/FR-027): re-resolve edit focus + section overrides
+            // against the fresh CST by structural-path identity. If the focused
+            // node still resolves, focus is kept; if it vanished, edit mode is
+            // dropped gracefully (never edit the wrong node). Cost is proportional
+            // to path depth, not row/node count.
+            self.view_state.reresolve(&result.cst.root());
+            // The current projection now matches the landed CST — clear stale.
+            self.view_state.clear_stale();
             self.parse = Some(result);
             installed = true;
         }
@@ -1045,6 +1104,127 @@ impl EditorDocument {
                 Some(format!("{kind}: {}", path.display()))
             }
             BindingState::NoBinding => None,
+        }
+    }
+
+    // --- E008: structural view state + projection + one-undo-unit edit ---------
+
+    /// The per-document structural view selection + edit focus + overrides + stale
+    /// marker (E008 — FR-015/FR-016/FR-017), read-only.
+    #[must_use]
+    pub fn view_state(&self) -> &ViewSelectionAndFocus {
+        &self.view_state
+    }
+
+    /// The per-document structural view state mutably (E008).
+    ///
+    /// The view switcher (`app.rs`) and the structural surfaces drive view
+    /// switching, focus, and overrides through this. Mutating view state changes
+    /// **zero** document bytes (FR-020).
+    #[must_use]
+    pub fn view_state_mut(&mut self) -> &mut ViewSelectionAndFocus {
+        &mut self.view_state
+    }
+
+    /// The shared structural projection of the document's top-level value (E008 —
+    /// AD-003/FR-015), or `None` until the first reparse lands.
+    ///
+    /// Re-derived once per landed reparse off the per-frame path
+    /// ([`poll_parse`](Self::poll_parse)); never recomputed per frame (FR-026).
+    #[must_use]
+    pub fn projection(&self) -> Option<&DerivedProjection> {
+        self.projection.as_ref()
+    }
+
+    /// The last structural-op inline error message, if one is showing (E008 —
+    /// FR-003).
+    ///
+    /// Set by a tree/table op blocked at commit (e.g. a rename collision); surfaced
+    /// inline by the structural view using the same indicator model as diagnostics
+    /// (FR-003/FR-018). `None` when no error is pending.
+    #[must_use]
+    pub fn tree_error(&self) -> Option<&str> {
+        self.tree_error.as_deref()
+    }
+
+    /// Set the structural-op inline error message (E008 — FR-003). The error is a
+    /// byte-free notice: a blocked op never changes the document.
+    pub fn set_tree_error(&mut self, message: String) {
+        self.tree_error = Some(message);
+    }
+
+    /// Clear the structural-op inline error message (E008 — FR-003), e.g. after a
+    /// successful op.
+    pub fn clear_tree_error(&mut self) {
+        self.tree_error = None;
+    }
+
+    /// Apply one structural edit as a single E007 undo unit (E008 — T012,
+    /// FR-013/FR-014).
+    ///
+    /// The one-undo-unit structural-edit pipeline:
+    ///
+    /// 1. Parse the **live buffer** into a CST (the resolved source of truth the
+    ///    caller's [`StructuralOp`] addresses against).
+    /// 2. Call `ron-core`'s pure [`apply_structural`]; the op's [`ParentRef`]
+    ///    /node addressing is `(kind + start-offset)`-based and is re-resolved
+    ///    inside the transform against this exact CST.
+    /// 3. On [`TransformOutcome::Applied`] install the new document text by
+    ///    **printing** the new CST into the buffer (untouched regions stay
+    ///    byte-for-byte — FR-013), record exactly **one** E007 undo unit (a
+    ///    multi-node op like reorder is still one unit — FR-014), bump the edit
+    ///    generation, and request an off-frame reparse so the projection
+    ///    re-derives. Returns `Ok(())`.
+    /// 4. On [`TransformOutcome::Blocked`] change **nothing** — no buffer change,
+    ///    no undo entry (a no-op never pollutes the undo stack — FR-014) — and
+    ///    return `Err(reason)` so the caller can surface an inline error.
+    ///
+    /// The single undo unit is achieved by forcing the recorded snapshot to start a
+    /// **fresh** undo unit (no coalesce): the op is one logical action, distinct
+    /// from a typing run, so its undo restores exactly the pre-edit bytes and its
+    /// redo replays exactly the post-edit bytes (FR-014, SC-002).
+    ///
+    /// `now` is the caller-side clock for the undo coalesce decision (`ron-core`
+    /// measures no clock — TR-014); the structural snapshot is always recorded as a
+    /// non-coalescing boundary regardless of timing.
+    ///
+    /// [`ParentRef`]: ron_core::ParentRef
+    pub fn apply_structural_edit(
+        &mut self,
+        op: StructuralOp,
+        worker: &ReparseWorker,
+        now: Instant,
+    ) -> Result<(), BlockedReason> {
+        // 1. The resolved CST the op addresses against is the live buffer's parse.
+        let cst = ron_core::parse(&self.buffer);
+        // 2/3/4. Apply the pure transform; only an `Applied` outcome mutates.
+        match apply_structural(&cst, op) {
+            TransformOutcome::Applied(new_cst) => {
+                // Ensure any in-flight coalescing typing run is flushed to its own
+                // boundary first, so the structural op is a *separate* undo unit
+                // and never merges with a prior keystroke run (FR-014).
+                self.record_undo_snapshot(now);
+                // Install the new text by printing the new CST: untouched regions
+                // are byte-for-byte identical (FR-013); only the touched subtree
+                // changed.
+                self.buffer = ron_core::print(&new_cst);
+                // One logical op = one undo unit. Bump the generation so the next
+                // `record_undo_snapshot` snapshots THIS new state, and force a fresh
+                // (non-coalescing) unit so undo restores exactly the prior bytes.
+                self.on_edit();
+                self.last_undo_instant = None;
+                self.record_undo_snapshot(now);
+                // Re-validate + re-derive the projection off-frame against the new
+                // text (FR-015/FR-026): the reparse will re-derive in `poll_parse`.
+                self.request_reparse(worker);
+                Ok(())
+            }
+            // 4. Blocked: no buffer change, no undo entry — surface the reason.
+            TransformOutcome::Blocked(reason) => Err(reason),
+            // `TransformOutcome` is `#[non_exhaustive]`: a future non-`Applied`
+            // outcome is treated conservatively as a block — change nothing, record
+            // no undo entry (never corrupt the document — §I / FR-014).
+            _ => Err(BlockedReason::TargetNotFound),
         }
     }
 }

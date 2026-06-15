@@ -71,8 +71,9 @@ use ron_core::{CompletionKind, Severity, SyntaxKind};
 use crate::completion::Trigger;
 use crate::diagnostics_map::DiagnosticView;
 use crate::document::{EditorDocument, HighlightModel, HighlightSpan};
-use crate::reparse::ParseResult;
+use crate::reparse::{ParseResult, ReparseWorker};
 use crate::snippets::TabStopKind;
+use crate::structural::tree::render_tree_view;
 
 /// The classification a highlight span carries (FR-019).
 ///
@@ -387,16 +388,21 @@ const EDITOR_FONT_SIZE: f32 = 13.0;
 
 /// Render the active-binding status strip for `doc` (E006 US2 — FR-011).
 ///
-/// Always visible above the editor so the author can tell whether type-awareness is
-/// on and against which type. When [`BindingState::Bound`](crate::binding::BindingState::Bound)
-/// it shows `Type: <name> (<origin>)` (via [`EditorDocument::binding_label`]) plus
-/// the source locator (`schema: …` / `rust: …`, via
-/// [`EditorDocument::binding_source_label`]); when
-/// [`BindingState::NoBinding`](crate::binding::BindingState::NoBinding) it shows an
-/// explicit `no type bound` indicator. The label text is exactly what
+/// Always visible above the active editing surface so the author can tell whether
+/// type-awareness is on and against which type — independent of which view (text /
+/// tree-form / table) is active (E008 — FR-017). When
+/// [`BindingState::Bound`](crate::binding::BindingState::Bound) it shows
+/// `Type: <name> (<origin>)` (via [`EditorDocument::binding_label`]) plus the source
+/// locator (`schema: …` / `rust: …`, via [`EditorDocument::binding_source_label`]);
+/// when [`BindingState::NoBinding`](crate::binding::BindingState::NoBinding) it shows
+/// an explicit `no type bound` indicator. The label text is exactly what
 /// [`EditorDocument::binding_label`] returns so tests can assert the shown state by
 /// querying the rendered label rather than scraping pixels.
-fn render_binding_indicator(ui: &mut Ui, doc: &EditorDocument) {
+///
+/// Public so the shell can render it above the **structural** views too (the text
+/// view renders it via [`editor_view`]), keeping the indicator visible in every
+/// view without duplicating it within a single view.
+pub fn render_binding_indicator(ui: &mut Ui, doc: &EditorDocument) {
     ui.horizontal(|ui| {
         let label = doc.binding_label();
         if doc.binding.is_bound() {
@@ -410,6 +416,43 @@ fn render_binding_indicator(ui: &mut Ui, doc: &EditorDocument) {
             ui.weak(label);
         }
     });
+}
+
+/// Host the structural **tree/form** view for `doc` (E008 / US1 — T025,
+/// FR-001/FR-002/FR-003/FR-004).
+///
+/// Renders the always-visible active-binding indicator (FR-011) above the tree, so
+/// type-awareness stays perceivable in every view, then the navigable tree/form
+/// surface ([`render_tree_view`]) where the user expands/collapses nodes, edits
+/// values inline, and invokes discoverable add/remove/reorder/rename/variant ops —
+/// each routed through the one-undo-unit structural-edit pipeline (FR-013/FR-014).
+///
+/// This is the [COMPLETES FR-001] host point: it replaces the Phase-1b structural
+/// placeholder pane so the tree/form view is the document's default structural
+/// surface (FR-017). The `worker` is the document's off-frame reparse worker, used
+/// to re-derive the projection after an edit lands.
+pub fn tree_form_view(ui: &mut Ui, doc: &mut EditorDocument, worker: &ReparseWorker) {
+    render_binding_indicator(ui, doc);
+    render_tree_view(ui, doc, worker);
+}
+
+/// Host the **auto-routing structural view** for `doc` (E008 / US3 — T039/T040,
+/// [COMPLETES FR-010]).
+///
+/// Renders the always-visible active-binding indicator (FR-011) above the
+/// auto-routing structural surface ([`render_structural_view`](crate::structural::render_structural_view)),
+/// which classifies the document's section and renders a table-eligible uniform list
+/// as an embedded table and everything else as tree/form, with a persistent
+/// per-section boundary indicator and a reversible per-section override
+/// (FR-010/FR-011/FR-012/FR-025).
+///
+/// This is the host the per-document switcher's structural arm uses (replacing the
+/// US1-only [`tree_form_view`]): the default structural view now auto-routes sections
+/// rather than always showing tree/form (FR-017). The `worker` is the document's
+/// off-frame reparse worker, used to re-derive the projection after an edit lands.
+pub fn structural_form_view(ui: &mut Ui, doc: &mut EditorDocument, worker: &ReparseWorker) {
+    render_binding_indicator(ui, doc);
+    crate::structural::render_structural_view(ui, doc, worker);
 }
 
 /// Render the editor surface for `doc`: a monospace multiline editor with a

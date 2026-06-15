@@ -49,6 +49,12 @@
 //! * **Print** — [`print`] / [`print_node`] (byte-for-byte round-trip).
 //! * **Edit** — [`apply_edit`] with [`EditOperation`] / [`EditTarget`] /
 //!   [`EditKind`] / [`TriviaPolicy`] (non-destructive; INV-8).
+//! * **Structural transform** — [`apply_structural`] with [`StructuralOp`] /
+//!   [`TransformOutcome`] / [`BlockedReason`] (E008 / ADR-0007): pure CST→CST
+//!   named structural ops (insert / remove / reorder / set-value / rename a
+//!   field-or-element, enum-variant swap, add-field-across-rows) composed over
+//!   [`apply_edit`] — byte-for-byte lossless on untouched regions (FR-013),
+//!   WASM-clean and reusable by a future LSP/web surface.
 //! * **Undo/redo** — [`UndoStack`] / [`UndoEntry`] (E007): a bounded,
 //!   WASM-clean CST + text + cursor history with exact-prior-byte restore;
 //!   reusable across surfaces and adds no filesystem/native dependency (TR-014).
@@ -96,6 +102,7 @@ pub mod lexer;
 pub mod parser;
 pub mod printer;
 pub mod syntax;
+pub mod transform;
 pub mod undo;
 
 pub use completion::{
@@ -111,6 +118,7 @@ pub use parser::{
 };
 pub use printer::{print, print_node};
 pub use syntax::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, TextRange};
+pub use transform::{apply_structural, BlockedReason, ParentRef, StructuralOp, TransformOutcome};
 pub use undo::{UndoCap, UndoEntry, UndoStack};
 
 /// Typed accessors over the CST (TR-010): navigate RON constructs by name

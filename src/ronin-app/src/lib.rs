@@ -42,5 +42,6 @@ pub mod recovery;
 pub mod reparse;
 pub mod settings;
 pub mod snippets;
+pub mod structural;
 pub mod type_acquire;
 pub mod workspace;
